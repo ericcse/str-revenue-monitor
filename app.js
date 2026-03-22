@@ -128,6 +128,46 @@ function finalizeLowerAndWeeksAhead(tp, low, wks, lowerRaw, weeksAheadRaw) {
 }
 
 /**
+ * After linear blend of pacing rows: **always keep the lerped Wks to Lower** for display/tooltip.
+ * Pricing uses computeEffectivePacingPercentile: two-phase only when wa < wksR and mid is strictly
+ * between loRamp and tgt; if wa >= wksR (or lower invalid), ramp is single-segment — no need to
+ * shrink wa to wksR−1 (that broke e.g. lerp 6→12 with small Wks to Lowest).
+ */
+function mergeInterpolatedLowerAndWeeksAhead(tpC, lowC, wksC, lowerInterp, weeksAheadInterp) {
+  const tgt = clampPct0to100(tpC);
+  const floor = clampPct0to100(lowC);
+  const loRamp = Math.min(floor, tgt);
+  const wksR = clampWeeksNonNeg(wksC);
+  if (wksR <= 0) {
+    return finalizeLowerAndWeeksAhead(tpC, lowC, wksC, lowerInterp, 0);
+  }
+  const wa = clampWeeksNonNeg(weeksAheadInterp);
+  if (wa === 0) {
+    return finalizeLowerAndWeeksAhead(tpC, lowC, wksC, lowerInterp, 0);
+  }
+
+  let lower = clampPct0to100(lowerInterp);
+  lower = Math.max(floor, Math.min(lower, tgt));
+
+  // Same two-phase validity as computeEffectivePacingPercentile
+  if (wa < wksR && lower > loRamp && lower < tgt) {
+    return { lowerPercentileTo: lower, weeksAhead: wa };
+  }
+
+  if (wa < wksR && tgt > loRamp + 1) {
+    lower = Math.round((tgt + loRamp) / 2);
+    lower = Math.max(loRamp + 1, Math.min(tgt - 1, lower));
+    if (lower > loRamp && lower < tgt) {
+      return { lowerPercentileTo: lower, weeksAhead: wa };
+    }
+  }
+
+  // wa >= wksR or still no valid mid: single-segment pricing; show true lerped Wks to Lower
+  const fin = finalizeLowerAndWeeksAhead(tpC, lowC, wksC, lowerInterp, 0);
+  return { lowerPercentileTo: fin.lowerPercentileTo, weeksAhead: wa };
+}
+
+/**
  * Keep row.weeksAhead (Wks to Lower) when the user saved it. finalizeLowerAndWeeksAhead() may zero it
  * for curve math, but that must not erase values on Save / Save as defaults / load from storage.
  * computeEffectivePacingPercentile() already ignores two-phase when values are invalid.
@@ -388,64 +428,138 @@ function getUnbookedPeriods(reservations, fromDate, daysAhead = DEFAULT_UNBOOKED
 }
 
 /**
- * Pick target price percentile from pacing rows: sort thresholds descending, first row where
- * finalExpected >= finalOccupancyPct wins. Include a 0% row as fallback.
+ * Normalize one pacing row into tier fields (target, ramp, etc.) for interpolation anchors.
  */
-function resolvePacingTarget(finalExpectedOccupancy, rows) {
-  const pct = Number(finalExpectedOccupancy);
-  if (!Number.isFinite(pct) || !rows || !rows.length) return null;
+function tierFromPacingRow(r, idx) {
+  const tp = clampPct0to100(r.targetPricePercentile);
+  let low =
+    r.lowestPricePercentile != null && r.lowestPricePercentile !== ''
+      ? clampPct0to100(r.lowestPricePercentile)
+      : Math.max(0, tp - 30);
+  if (low > tp) low = tp;
+  const wks = r.weeksToStartReducing != null ? clampWeeksNonNeg(r.weeksToStartReducing) : 3;
+  const fin = finalizeLowerAndWeeksAhead(tp, low, wks, r.lowerPercentileTo, r.weeksAhead);
+  const weeksAhead = coalesceStoredWeeksAhead(r, fin.weeksAhead);
+  const th = Number(r.finalOccupancyPct);
+  const id = String(r.id || `row-${idx}`).replace(/[^a-zA-Z0-9_-]/g, '');
+  return {
+    targetPricePercentile: tp,
+    lowestPricePercentile: low,
+    weeksToStartReducing: wks,
+    lowerPercentileTo: fin.lowerPercentileTo,
+    weeksAhead,
+    thresholdFinalOcc: th,
+    tierClass: id || `row-${idx}`,
+  };
+}
+
+/**
+ * Unique Final Occ. % thresholds, ascending (duplicate % → last row wins). Each anchor is a normalized tier.
+ */
+function buildPacingInterpolationAnchors(rows) {
   const valid = rows.filter(
     (r) =>
       r &&
       Number.isFinite(Number(r.finalOccupancyPct)) &&
       Number.isFinite(Number(r.targetPricePercentile))
   );
-  if (!valid.length) return null;
-  const sorted = [...valid].sort((a, b) => Number(b.finalOccupancyPct) - Number(a.finalOccupancyPct));
-  for (let i = 0; i < sorted.length; i++) {
-    const r = sorted[i];
-    const th = Number(r.finalOccupancyPct);
-    if (pct >= th) {
-      const tp = clampPct0to100(r.targetPricePercentile);
-      let low =
-        r.lowestPricePercentile != null && r.lowestPricePercentile !== ''
-          ? clampPct0to100(r.lowestPricePercentile)
-          : Math.max(0, tp - 30);
-      if (low > tp) low = tp;
-      const wks = r.weeksToStartReducing != null ? clampWeeksNonNeg(r.weeksToStartReducing) : 3;
-      const fin = finalizeLowerAndWeeksAhead(tp, low, wks, r.lowerPercentileTo, r.weeksAhead);
-      const weeksAhead = coalesceStoredWeeksAhead(r, fin.weeksAhead);
-      const id = String(r.id || `row-${i}`).replace(/[^a-zA-Z0-9_-]/g, '');
-      return {
-        targetPricePercentile: tp,
-        lowestPricePercentile: low,
-        weeksToStartReducing: wks,
-        lowerPercentileTo: fin.lowerPercentileTo,
-        weeksAhead,
-        thresholdFinalOcc: th,
-        tierClass: id || `row-${i}`,
-      };
-    }
+  if (!valid.length) return [];
+  const byTh = new Map();
+  valid.forEach((r) => {
+    byTh.set(Number(r.finalOccupancyPct), r);
+  });
+  const sortedPairs = [...byTh.entries()].sort((a, b) => a[0] - b[0]);
+  return sortedPairs.map(([th, r], i) => tierFromPacingRow(r, i));
+}
+
+/**
+ * Hover text for Rec. Pctl %: interpolated pacing settings from LY final vs Final Occ. % rows.
+ */
+function buildRecPctlCellTitle(tier, effectivePct) {
+  if (!tier) return '';
+  const lines = [];
+  if (tier.pacingInterpolatedLyFinal != null && Number.isFinite(tier.pacingInterpolatedLyFinal)) {
+    lines.push(
+      `LY final ${Math.round(tier.pacingInterpolatedLyFinal)}% — linear blend between pacing rows (Final Occ. %)`
+    );
+    lines.push('—');
   }
-  const last = sorted[sorted.length - 1];
-  const tpL = clampPct0to100(last.targetPricePercentile);
-  let lowL =
-    last.lowestPricePercentile != null && last.lowestPricePercentile !== ''
-      ? clampPct0to100(last.lowestPricePercentile)
-      : Math.max(0, tpL - 30);
-  if (lowL > tpL) lowL = tpL;
-  const wksL = last.weeksToStartReducing != null ? clampWeeksNonNeg(last.weeksToStartReducing) : 3;
-  const finL = finalizeLowerAndWeeksAhead(tpL, lowL, wksL, last.lowerPercentileTo, last.weeksAhead);
-  const weeksAheadL = coalesceStoredWeeksAhead(last, finL.weeksAhead);
-  return {
-    targetPricePercentile: tpL,
-    lowestPricePercentile: lowL,
-    weeksToStartReducing: wksL,
-    lowerPercentileTo: finL.lowerPercentileTo,
-    weeksAhead: weeksAheadL,
-    thresholdFinalOcc: Number(last.finalOccupancyPct),
-    tierClass: String(last.id || 'row-fallback').replace(/[^a-zA-Z0-9_-]/g, '') || 'row-fallback',
-  };
+  lines.push(`Target Pctl %: ${tier.targetPricePercentile}`);
+  lines.push(`Lower Pctl %: ${tier.lowerPercentileTo}`);
+  lines.push(`Wks to Lower: ${tier.weeksAhead}`);
+  lines.push(`Lowest Pctl%: ${tier.lowestPricePercentile}`);
+  lines.push(`Wks to Lowest: ${tier.weeksToStartReducing}`);
+  if (effectivePct != null && Number.isFinite(Number(effectivePct))) {
+    lines.push('—');
+    lines.push(`Rec. Pctl % (this stay): ${effectivePct}%`);
+  }
+  return escapeHtmlAttr(lines.join('\n')).replace(/\n/g, '&#10;');
+}
+
+/**
+ * Resolve pacing tier from LY final expected occupancy: linear interpolation on **Final Occ. %**
+ * between pacing rows for Target / Lower / Wks to Lower / Lowest / Wks to Lowest, then time-based
+ * ramp yields Rec. Pctl % for each stay week.
+ */
+function resolvePacingTarget(finalExpectedOccupancy, rows) {
+  const pct = Number(finalExpectedOccupancy);
+  if (!Number.isFinite(pct) || !rows || !rows.length) return null;
+  const anchors = buildPacingInterpolationAnchors(rows);
+  if (!anchors.length) return null;
+
+  const withLy = (tier) => ({ ...tier, pacingInterpolatedLyFinal: pct });
+
+  if (anchors.length === 1) {
+    return withLy({ ...anchors[0] });
+  }
+
+  const tMin = anchors[0].thresholdFinalOcc;
+  const tMax = anchors[anchors.length - 1].thresholdFinalOcc;
+
+  /** No extrapolation outside [tMin, tMax]: clamp to end anchors as-is. */
+  if (pct < tMin) {
+    return withLy({ ...anchors[0] });
+  }
+  if (pct > tMax) {
+    return withLy({ ...anchors[anchors.length - 1] });
+  }
+
+  for (let i = 0; i < anchors.length - 1; i++) {
+    const lo = anchors[i].thresholdFinalOcc;
+    const hi = anchors[i + 1].thresholdFinalOcc;
+    if (pct < lo || pct > hi) continue;
+    if (hi <= lo) {
+      return withLy({ ...anchors[i] });
+    }
+    const u = (pct - lo) / (hi - lo);
+    const L = anchors[i];
+    const R = anchors[i + 1];
+    const tp = Math.round(L.targetPricePercentile + (R.targetPricePercentile - L.targetPricePercentile) * u);
+    const lowI = Math.round(
+      L.lowestPricePercentile + (R.lowestPricePercentile - L.lowestPricePercentile) * u
+    );
+    const wksR = Math.round(
+      L.weeksToStartReducing + (R.weeksToStartReducing - L.weeksToStartReducing) * u
+    );
+    const lowerI = Math.round(L.lowerPercentileTo + (R.lowerPercentileTo - L.lowerPercentileTo) * u);
+    const wksA = Math.round(L.weeksAhead + (R.weeksAhead - L.weeksAhead) * u);
+    const tpC = clampPct0to100(tp);
+    let lowC = clampPct0to100(lowI);
+    if (lowC > tpC) lowC = tpC;
+    const wksC = clampWeeksNonNeg(wksR);
+    const fin = mergeInterpolatedLowerAndWeeksAhead(tpC, lowC, wksC, lowerI, wksA);
+    return withLy({
+      targetPricePercentile: tpC,
+      lowestPricePercentile: lowC,
+      weeksToStartReducing: wksC,
+      lowerPercentileTo: fin.lowerPercentileTo,
+      weeksAhead: fin.weeksAhead,
+      thresholdFinalOcc: Math.round(pct),
+      tierClass: 'pacing-interpolated',
+    });
+  }
+
+  return withLy({ ...anchors[anchors.length - 1] });
 }
 
 /**
@@ -972,6 +1086,14 @@ function escapeHtml(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** For HTML attribute values (e.g. title="..."). */
+function escapeHtmlAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;');
 }
 
 function parsePercentLike(cell) {
@@ -2130,19 +2252,8 @@ function render(reservations, periodKey, revenueTarget) {
           const tier = fp.tier;
           const eff = tier ? tier.effectivePacingPercentile ?? tier.targetPricePercentile : null;
           const pctStr = tier && eff != null ? `${eff}%` : '—';
-          const tierTitle = tier
-            ? `Suggested ${eff}% · LY final ≥ ${tier.thresholdFinalOcc}% · ${
-                tier.weeksToStartReducing > 0
-                  ? tier.weeksAhead > 0 &&
-                    tier.lowerPercentileTo > tier.lowestPricePercentile &&
-                    tier.lowerPercentileTo < tier.targetPricePercentile
-                    ? `Target ${tier.targetPricePercentile}% → Lower ${tier.lowerPercentileTo}% (Wks to Lower ${tier.weeksAhead}) → Lowest ${tier.lowestPricePercentile}% (Wks to Lowest ${tier.weeksToStartReducing})`
-                    : `Target ${tier.targetPricePercentile}% → Lowest ${tier.lowestPricePercentile}% (Wks to Lowest ${tier.weeksToStartReducing})`
-                  : 'no time ramp'
-              }`
-            : '';
-          const tierTitleAttr = tierTitle
-            ? ` title="${tierTitle.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"`
+          const tierTitleAttr = tier
+            ? ` title="${buildRecPctlCellTitle(tier, eff)}"`
             : '';
           const heat = tier && eff != null ? pacingPercentileHeatClass(eff) : '';
           const tierClass = tier ? `pct-cell ${heat}` : 'pct-cell';
