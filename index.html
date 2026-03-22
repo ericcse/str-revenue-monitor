@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>STR Revenue Monitor — Pacing & Revenue</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-left">
+        <h1>STR Revenue Monitor</h1>
+        <p class="subtitle">Pacing & revenue management · Hospitable · PriceLabs</p>
+      </div>
+      <div class="header-right">
+        <div class="period-select unbooked-horizon-select" title="Unbooked date chips: only nights in this range. Future unbooked table: rows that touch this range show the full Fri–Thu period even if it ends after the range">
+          <label for="unbookedHorizon">Unbooked</label>
+          <select id="unbookedHorizon">
+            <option value="30">1 month</option>
+            <option value="90" selected>3 months</option>
+            <option value="180">6 months</option>
+            <option value="270">9 months</option>
+            <option value="365">12 months</option>
+          </select>
+        </div>
+        <button type="button" id="openSettings" class="btn-secondary" title="Edit pacing tier rules">Pacing settings</button>
+        <label class="upload-btn" title="Upload calendar or revenue CSV">
+          <input type="file" id="csvInput" accept=".csv" hidden />
+          Upload CSV
+        </label>
+        <button type="button" id="useSample" class="btn-secondary">Sample data</button>
+        <button type="button" id="fetchHospitable" class="btn-secondary" title="Fetch reservations from Hospitable (local server)">Fetch Hospitable</button>
+        <div class="period-select">
+          <label for="period">Period</label>
+          <select id="period">
+            <option value="month">This month</option>
+            <option value="quarter">This quarter</option>
+            <option value="year">This year</option>
+          </select>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="top-metrics-row">
+      <!-- Pacing -->
+      <section class="card card-pacing card-compact-metrics">
+        <h2>Pacing</h2>
+        <p class="card-desc">Revenue and occupancy vs target and prior period</p>
+        <div class="pacing-grid">
+          <div class="metric-box">
+            <span class="metric-label">Revenue pace</span>
+            <span class="metric-value" id="revenuePace">—</span>
+            <span class="metric-meta" id="revenuePaceMeta">vs target</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">Occupancy pace</span>
+            <span class="metric-value" id="occupancyPace">—</span>
+            <span class="metric-meta" id="occupancyPaceMeta">vs target</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-label">Days elapsed</span>
+            <span class="metric-value" id="daysElapsed">—</span>
+            <span class="metric-meta" id="daysTotal">of period</span>
+          </div>
+          <div class="metric-box highlight">
+            <span class="metric-label">Pacing status</span>
+            <span class="metric-value" id="pacingStatus">—</span>
+            <span class="metric-meta" id="pacingAction">Set target to compare</span>
+          </div>
+        </div>
+        <div class="target-row">
+          <label>Revenue target this period ($)</label>
+          <input type="number" id="revenueTarget" placeholder="e.g. 4500" min="0" step="100" />
+          <button type="button" id="saveTarget" class="btn-small">Save target</button>
+        </div>
+      </section>
+
+      <!-- Revenue metrics -->
+      <section class="card card-compact-metrics">
+        <h2>Revenue metrics</h2>
+        <p class="card-desc">Current period performance</p>
+        <div class="metrics-row">
+          <div class="metric-tile">
+            <span class="tile-label">Revenue</span>
+            <span class="tile-value" id="revenue">—</span>
+          </div>
+          <div class="metric-tile">
+            <span class="tile-label">ADR</span>
+            <span class="tile-value" id="adr">—</span>
+          </div>
+          <div class="metric-tile">
+            <span class="tile-label">Occupancy %</span>
+            <span class="tile-value" id="occupancy">—</span>
+          </div>
+          <div class="metric-tile">
+            <span class="tile-label">RevPAR</span>
+            <span class="tile-value" id="revpar">—</span>
+          </div>
+          <div class="metric-tile">
+            <span class="tile-label">Nights booked</span>
+            <span class="tile-value" id="nightsBooked">—</span>
+          </div>
+        </div>
+      </section>
+      </div>
+
+      <!-- Future unbooked periods: market pacing & pricing -->
+      <section class="card card-future-pacing">
+        <h2>Future unbooked periods — market pacing</h2>
+        <p class="card-desc">Market current vs final expected occupancy (last year). Remaining booking potential and suggested price percentile.</p>
+        <div id="futurePacingTableWrap" class="future-pacing-wrap">
+          <p class="empty-hint" id="futurePacingEmpty">Load data to see future periods and market pacing.</p>
+          <table class="future-pacing-table" id="futurePacingTable" hidden>
+            <thead>
+              <tr>
+                <th>Period</th>
+                <th>Days of Week</th>
+                <th>Unbooked nights</th>
+                <th>Market current occ.</th>
+                <th>Market final expected occ.</th>
+                <th>Remaining potential</th>
+                <th>Price at percentile</th>
+              </tr>
+            </thead>
+            <tbody id="futurePacingBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Gap analysis & actions -->
+      <section class="card card-actions">
+        <h2>Gap analysis & recommendations</h2>
+        <p class="card-desc">Unbooked dates and pricing change recommendations</p>
+        <div class="gaps-section">
+          <div class="gap-block">
+            <h3 id="unbookedSectionHeading">Unbooked dates</h3>
+            <div id="unbookedDates" class="date-list">Load data to see gaps.</div>
+          </div>
+          <div class="gap-block">
+            <h3>Recommendations</h3>
+            <ul id="recommendations" class="rec-list">
+              <li>Upload calendar/revenue data or use sample data to see recommendations.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings modal -->
+      <div class="modal-overlay" id="settingsOverlay" hidden>
+        <div class="modal card">
+          <div class="modal-header">
+            <h2>Pacing settings</h2>
+            <button type="button" class="modal-close" id="closeSettings" aria-label="Close">&times;</button>
+          </div>
+          <p class="card-desc">Map market final expected occupancy to your target price percentile. When the market is expected to be full (e.g. ≥75%), price at the top of the market; when demand is lower, price in a lower band. Later: pull from PriceLabs when available.</p>
+          <div class="tiers-editor">
+            <table class="tiers-table">
+              <thead>
+                <tr>
+                  <th>When final occupancy is</th>
+                  <th>Price at percentile</th>
+                </tr>
+              </thead>
+              <tbody id="tiersTableBody">
+                <!-- filled by JS -->
+              </tbody>
+            </table>
+            <div class="modal-actions">
+              <button type="button" id="savePacingSettings" class="upload-btn">Save settings</button>
+              <button type="button" id="resetPacingSettings" class="btn-secondary">Reset to defaults</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Integration status -->
+      <section class="card card-integrations">
+        <h2>Data source</h2>
+        <p class="card-desc">Connect Hospitable & PriceLabs for live data (see README)</p>
+        <div class="integrations-status">
+          <div class="integration-item">
+            <span class="dot"></span>
+            <span>Hospitable API — reservations/calendar</span>
+          </div>
+          <div class="integration-item">
+            <span class="dot"></span>
+            <span>PriceLabs — market occupancy & percentiles (when API available)</span>
+          </div>
+          <div class="integration-item current">
+            <span class="dot"></span>
+            <span>CSV + sample market data (active)</span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
