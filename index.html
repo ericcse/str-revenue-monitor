@@ -21,15 +21,15 @@
           <label for="unbookedHorizon">Unbooked</label>
           <select id="unbookedHorizon">
             <option value="30">1 month</option>
-            <option value="90" selected>3 months</option>
+            <option value="120" selected>4 months</option>
             <option value="180">6 months</option>
             <option value="270">9 months</option>
             <option value="365">12 months</option>
           </select>
         </div>
         <button type="button" id="openSettings" class="btn-secondary" title="Edit pacing tier rules">Pacing settings</button>
-        <label class="upload-btn" title="Upload calendar or revenue CSV">
-          <input type="file" id="csvInput" accept=".csv" hidden />
+        <label class="upload-btn" title="Upload calendar or revenue CSV / Excel (first sheet)">
+          <input type="file" id="csvInput" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
           Upload CSV
         </label>
         <button type="button" id="useSample" class="btn-secondary">Sample data</button>
@@ -44,6 +44,45 @@
         </div>
       </div>
     </header>
+
+    <section class="market-csv-panel" aria-label="CSV upload">
+      <div
+        id="marketCsvDropzone"
+        class="csv-dropzone"
+        tabindex="0"
+        role="button"
+        aria-label="Drop a CSV file here or press Enter to browse"
+      >
+        <div class="csv-dropzone-inner">
+          <strong>Drag &amp; drop CSV or Excel</strong>
+          <span class="csv-dropzone-hint">Market pacing (week + occupancy columns) or booking export (check-in / check-out) · first sheet only for .xls / .xlsx</span>
+          <p class="csv-dropzone-detail">
+            <strong>Market file:</strong> a week column such as <code>Date</code>, <code>week_start</code>, <code>period_start</code>, or <code>week_of</code>,
+            plus any of <code>market_occ</code>, <code>lyt</code>, <code>market_occ_ly_final</code>, <code>remaining_potential</code>,
+            and optional price columns — e.g. <code>Final Price</code>, <code>Market 25th Percentile Price</code> … <code>Market 90th Percentile Price</code> (any similar <code>final_price</code> / <code>price_p25</code>… names work).
+            Other columns are stored on each row. <strong>Booking file:</strong> same as header &ldquo;Upload CSV&rdquo; (<code>check_in</code>, <code>check_out</code>, revenue).
+            After you load a file, the <em>Column mapping</em> table lists which header we used for each field.
+          </p>
+        </div>
+        <input type="file" id="marketCsvInput" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
+      </div>
+      <p class="market-csv-status" id="marketCsvStatus" role="status"></p>
+      <div class="market-column-map" id="marketColumnMap" hidden>
+        <h3 class="market-column-map-title">Column mapping</h3>
+        <p class="market-column-map-sub">How your CSV headers map to the dashboard (edit the file to match if a row shows —).</p>
+        <table class="market-column-map-table">
+          <thead>
+            <tr>
+              <th>Field</th>
+              <th>Your column</th>
+            </tr>
+          </thead>
+          <tbody id="marketColumnMapBody"></tbody>
+        </table>
+        <p class="market-extra-cols" id="marketExtraCols" hidden></p>
+      </div>
+      <button type="button" id="clearMarketCsv" class="btn-secondary btn-small market-clear-btn" hidden>Clear market CSV</button>
+    </section>
 
     <main class="main">
       <div class="top-metrics-row">
@@ -112,19 +151,39 @@
       <!-- Future unbooked periods: market pacing & pricing -->
       <section class="card card-future-pacing">
         <h2>Future unbooked periods — market pacing</h2>
-        <p class="card-desc">Market current vs final expected occupancy (last year). Remaining booking potential and suggested price percentile.</p>
+        <p class="card-desc">Market occupancy (current), last-year pace on the same calendar date (LYT), and last year’s realized market occupancy (LY final). Remaining potential vs current (LY final − current), remaining potential vs LY pace (LY final − LYT), and suggested price percentile.</p>
+        <div id="futurePacingCharts" class="future-pacing-charts" hidden>
+          <div class="future-pacing-chart-block">
+            <div class="future-pacing-chart-scroll">
+              <div class="future-pacing-chart-canvas-wrap" id="futurePacingChartCanvasWrap">
+                <canvas
+                  id="futurePacingChartCombined"
+                  aria-label="Current vs last year: market occupancy and remaining potential by period"
+                ></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
         <div id="futurePacingTableWrap" class="future-pacing-wrap">
           <p class="empty-hint" id="futurePacingEmpty">Load data to see future periods and market pacing.</p>
           <table class="future-pacing-table" id="futurePacingTable" hidden>
             <thead>
               <tr>
-                <th>Period</th>
-                <th>Days of Week</th>
-                <th>Unbooked nights</th>
-                <th>Market current occ.</th>
-                <th>Market final expected occ.</th>
-                <th>Remaining potential</th>
-                <th>Price at percentile</th>
+                <th title="Stay period (check unbooked range)">Period</th>
+                <th title="Days of week">DOW</th>
+                <th title="Unbooked nights">Nts</th>
+                <th title="Market occupancy (current)">Cur</th>
+                <th title="Market occupancy last year today (pace)">LYT</th>
+                <th title="Market occupancy LY final (realized)">LY fin</th>
+                <th title="Remaining potential vs current (LY final − current, or file)">Rem</th>
+                <th title="Remaining potential vs LY pace (LY final − LYT)">Rm LY</th>
+                <th title="Final / recommended nightly price">Fin $</th>
+                <th title="Implied percentile of Final $ vs P25–P90 (piecewise linear)">Fin %</th>
+                <th title="25th percentile market price">P25</th>
+                <th title="50th percentile (median) market price">P50</th>
+                <th title="75th percentile market price">P75</th>
+                <th title="90th percentile market price">P90</th>
+                <th title="Suggested price percentile band">Pctl</th>
               </tr>
             </thead>
             <tbody id="futurePacingBody"></tbody>
@@ -199,6 +258,10 @@
       </section>
     </main>
   </div>
+  <!-- SheetJS (xlsx) for .xls / .xlsx in the browser; same parsing pipeline as CSV -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -31,9 +31,10 @@ body {
 }
 
 .app {
-  max-width: 1280px;
+  width: 100%;
+  max-width: min(100%, 1760px);
   margin: 0 auto;
-  padding: 1.5rem 1.75rem 2.5rem;
+  padding: 1.5rem clamp(1rem, 3vw, 2rem) 2.5rem;
 }
 
 /* Header — single row: title left, actions right */
@@ -631,6 +632,162 @@ body {
   color: var(--text-muted);
 }
 
+/* Top CSV drop zone (market pacing + optional booking CSV) */
+.market-csv-panel {
+  margin-bottom: 1.5rem;
+}
+
+.csv-dropzone {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  outline: none;
+}
+
+.csv-dropzone:hover,
+.csv-dropzone:focus-visible {
+  border-color: var(--accent-dim);
+  background: var(--surface-hover);
+}
+
+.csv-dropzone--dragover {
+  border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.csv-dropzone--has-file {
+  border-style: solid;
+  border-color: var(--border);
+}
+
+.csv-dropzone-inner strong {
+  display: block;
+  font-size: 0.95rem;
+  margin-bottom: 0.25rem;
+}
+
+.csv-dropzone-hint {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.csv-dropzone-detail {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+  max-width: 72ch;
+}
+
+.csv-dropzone-detail code {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--accent);
+  background: rgba(88, 166, 255, 0.08);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.market-csv-status {
+  margin: 0.65rem 0 0;
+  font-size: 0.875rem;
+  min-height: 1.25em;
+}
+
+.market-csv-status--ok {
+  color: var(--success);
+}
+
+.market-csv-status--err {
+  color: var(--danger);
+}
+
+.market-column-map {
+  margin-top: 1rem;
+  padding: 1rem 1.1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.market-column-map-title {
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+}
+
+.market-column-map-sub {
+  margin: 0 0 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.market-column-map-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+
+.market-column-map-table th,
+.market-column-map-table td {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.market-column-map-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.market-column-map-table code {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.market-extra-cols {
+  margin: 0.75rem 0 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.market-clear-btn {
+  margin-top: 0.75rem;
+}
+
+/* Future pacing charts */
+.future-pacing-charts {
+  margin-bottom: 1.5rem;
+}
+
+.future-pacing-chart-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem 0.4rem;
+  min-width: 0;
+}
+
+.future-pacing-chart-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.future-pacing-chart-canvas-wrap {
+  position: relative;
+  height: 280px;
+  width: 100%;
+  min-width: 100%;
+}
+
 /* Future pacing table */
 .future-pacing-wrap {
   overflow-x: auto;
@@ -639,15 +796,15 @@ body {
 .future-pacing-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 0.875rem;
+  font-size: 0.78rem;
 }
 
 .future-pacing-table th,
 .future-pacing-table td {
-  padding: 0.6rem 0.75rem;
-  text-align: left;
+  padding: 0.32rem 0.38rem;
+  text-align: center;
   border-bottom: 1px solid var(--border);
-  vertical-align: top;
+  vertical-align: middle;
 }
 
 .future-pacing-table tbody tr:hover td {
@@ -659,10 +816,36 @@ body {
   font-weight: 600;
   white-space: nowrap;
   background: var(--bg);
+  letter-spacing: -0.02em;
 }
 
 .future-pacing-table .pct-cell {
   font-family: var(--font-mono);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.future-pacing-table .future-pacing-num-cell {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.future-pacing-table .future-pacing-dow-cell {
+  white-space: nowrap;
+  max-width: 4.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.future-pacing-table .future-pacing-period-cell {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.future-pacing-table .money-cell {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.76rem;
 }
 
 .future-pacing-table .tier-high { color: var(--success); }
