@@ -7,8 +7,7 @@ A one-stop **pacing and revenue** dashboard for short-term rentals managed with 
 - **Pacing** — Revenue and occupancy vs your target for the current month/quarter/year. “On pace” / “Behind” status.
 - **Revenue metrics** — Revenue, ADR, occupancy %, RevPAR, nights booked for the selected period.
 - **Future unbooked periods (market pacing)** — For each week with unbooked nights: **market current occupancy** (how full the market is today for those dates), **market final expected occupancy** (based on last year), and **remaining potential** (how much more demand is likely). From that, the app suggests a **price percentile** (e.g. “price at 75–100%” when final occupancy is high).
-- **Configurable pacing tiers** — You define when to price at which percentile:
-  - Example: final occupancy ≥75% → price at 75–100 percentile; 50–75% → 50–75; &lt;50% → 25–50. All thresholds and percentile ranges are editable under **Pacing settings**.
+- **Configurable pacing rules** — Columns: **Final Occ. %**, **Target Pctl %**, **Lower Pctl %**, **Wks to Lower**, **Lowest Pctl%**, **Wks to Lowest**. When LY final ≥ Final Occ., that row applies. Ramp **Target → Lower** by **Wks to Lower** weeks out, then **Lower → Lowest** by stay; **Wks to Lowest** is when the ramp starts from Target. **Wks to Lower** = 0 (or invalid) → one-step Target → Lowest. **Wks to Lowest** = 0 → always Target. **0%** Final Occ. = catch-all.
 - **Gap analysis** — Unbooked dates in the next 90 days and **pricing change recommendations** (e.g. “Week of 3/17: market final 72% → price at 50–75 percentile”).
 
 ## Quick start
@@ -17,7 +16,7 @@ A one-stop **pacing and revenue** dashboard for short-term rentals managed with 
 2. Click **Use sample data** to see the dashboard with demo reservations.
 3. Set a **Revenue target** and click **Save target** to see pacing vs that target.
 4. Switch **Pacing period** (month / quarter / year) to change the comparison window.
-5. Click **Pacing settings** to change how **market final expected occupancy** maps to your target **price percentile** (e.g. high demand → 75–100%, mid → 50–75%, low → 25–50%).
+5. Click **Pacing settings** to edit pacing rows. **Save as defaults** stores the current table as what **Reset to defaults** will reload (separate from **Save settings**, which applies the live dashboard config).
 
 ## Your own data (CSV)
 
@@ -58,7 +57,7 @@ The dashboard logic (pacing, metrics, gaps, recommendations) can stay as-is; onl
 
 - `index.html` — Dashboard layout and sections.
 - `styles.css` — Layout and theme.
-- `app.js` — Pacing, metrics, future-period market pacing, configurable tiers, unbooked dates, pricing recommendations, CSV parsing, sample data.
+- `app.js` — Pacing, metrics, future-period market pacing, configurable pacing rows, unbooked dates, pricing recommendations, CSV parsing, sample data.
 - `README.md` — This file.
 
 ## Pacing in plain English
@@ -68,4 +67,4 @@ The dashboard logic (pacing, metrics, gaps, recommendations) can stay as-is; onl
   - Example: 10 days into a 30-day month → you’ve had 33% of the period. To be on pace, you’d want at least ~33% of your target (e.g. $1,485 if target is $4,500).
 - **On pace** = actual revenue is at or above that implied target. **Behind** = below; the recommendations suggest checking PriceLabs and minimum stays to improve pacing.
 
-**Market-based pricing:** For future unbooked dates, the app compares the market’s **current** occupancy (how booked the market is today for that period) to the market’s **final expected** occupancy (e.g. from last year). The gap is “remaining potential” demand. Based on your **Pacing settings**, it then suggests which **price percentile** to target (e.g. 75–100% when the market is expected to be very full). Later you can replace the sample market data with PriceLabs (or another source) for live market occupancy and percentile data.
+**Market-based pricing:** For future unbooked dates, the app compares the market’s **current** occupancy (how booked the market is today for that period) to the market’s **final expected** occupancy (e.g. from last year). The gap is “remaining potential” demand. Based on your **Pacing settings** (threshold rows), it suggests a **target price percentile** for each period. Later you can replace the sample market data with PriceLabs (or another source) for live market occupancy and percentile data.

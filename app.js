@@ -7,7 +7,10 @@ const STORAGE_KEYS = {
   revenueTarget: 'str-monitor-revenue-target',
   period: 'str-monitor-period',
   reservations: 'str-monitor-reservations',
-  pacingTiers: 'str-monitor-pacing-tiers',
+  /** Two-column pacing rules (replaces legacy range-based tiers). */
+  pacingRows: 'str-monitor-pacing-rows',
+  /** User-defined template for “Reset to defaults” (set via Save as Defaults). */
+  pacingRowsDefaults: 'str-monitor-pacing-rows-defaults',
   unbookedHorizonDays: 'str-monitor-unbooked-horizon-days',
   marketPacing: 'str-monitor-market-pacing',
 };
@@ -50,12 +53,93 @@ function getApiBase() {
   return 'http://localhost:3001';
 }
 
-// Default: final occupancy ≥75% → 75-100 pct, 50-75% → 50-75 pct, <50% → 25-50 pct
-const DEFAULT_PACING_TIERS = [
-  { id: 'high', label: 'High demand', minFinalOccupancy: 75, maxFinalOccupancy: 100, minPercentile: 75, maxPercentile: 100 },
-  { id: 'mid', label: 'Mid demand', minFinalOccupancy: 50, maxFinalOccupancy: 75, minPercentile: 50, maxPercentile: 75 },
-  { id: 'low', label: 'Low demand', minFinalOccupancy: 0, maxFinalOccupancy: 50, minPercentile: 25, maxPercentile: 50 },
+// Default thresholds (highest first). 0% = catch-all. Optional two-step ramp: Target → Lower @ Wks ahead → Lowest @ stay.
+const DEFAULT_PACING_ROWS = [
+  {
+    id: 'r-high',
+    finalOccupancyPct: 75,
+    targetPricePercentile: 80,
+    lowestPricePercentile: 50,
+    weeksToStartReducing: 3,
+    lowerPercentileTo: 65,
+    weeksAhead: 1,
+  },
+  {
+    id: 'r-mid',
+    finalOccupancyPct: 50,
+    targetPricePercentile: 55,
+    lowestPricePercentile: 25,
+    weeksToStartReducing: 3,
+    lowerPercentileTo: 40,
+    weeksAhead: 1,
+  },
+  {
+    id: 'r-low',
+    finalOccupancyPct: 0,
+    targetPricePercentile: 30,
+    lowestPricePercentile: 15,
+    weeksToStartReducing: 3,
+    lowerPercentileTo: 22,
+    weeksAhead: 1,
+  },
 ];
+
+function clampPct0to100(n) {
+  const x = Math.round(Number(n));
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(100, x));
+}
+
+/** Weeks before stay to start ramping target → lowest (0 = always use target). */
+function clampWeeksNonNeg(n) {
+  const x = Math.round(Number(n));
+  if (!Number.isFinite(x) || x < 0) return 0;
+  return Math.min(104, x);
+}
+
+function newPacingRowId() {
+  return `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+/**
+ * Lower Pctl % and Wks to Lower (vs Wks to Lowest) for two-segment ramp.
+ * If invalid or redundant, weeksAhead becomes 0 (single segment Target → Lowest).
+ */
+function finalizeLowerAndWeeksAhead(tp, low, wks, lowerRaw, weeksAheadRaw) {
+  const tgt = clampPct0to100(tp);
+  let lo = clampPct0to100(low);
+  if (lo > tgt) lo = tgt;
+  const wksR = clampWeeksNonNeg(wks);
+  if (wksR <= 0) {
+    return { lowerPercentileTo: lo, weeksAhead: 0 };
+  }
+  let lower =
+    lowerRaw != null && lowerRaw !== '' ? clampPct0to100(lowerRaw) : Math.round((tgt + lo) / 2);
+  lower = Math.max(lo, Math.min(lower, tgt));
+  let wa =
+    weeksAheadRaw != null && weeksAheadRaw !== ''
+      ? clampWeeksNonNeg(weeksAheadRaw)
+      : wksR > 1
+        ? 1
+        : 0;
+  if (wa >= wksR) wa = 0;
+  if (lower <= lo || lower >= tgt) wa = 0;
+  return { lowerPercentileTo: lower, weeksAhead: wa };
+}
+
+/**
+ * Keep row.weeksAhead (Wks to Lower) when the user saved it. finalizeLowerAndWeeksAhead() may zero it
+ * for curve math, but that must not erase values on Save / Save as defaults / load from storage.
+ * computeEffectivePacingPercentile() already ignores two-phase when values are invalid.
+ */
+function coalesceStoredWeeksAhead(row, finWeeksAhead) {
+  if (!row) return finWeeksAhead;
+  const v = row.weeksAhead;
+  if (v == null || v === '') return finWeeksAhead;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return finWeeksAhead;
+  return clampWeeksNonNeg(n);
+}
 
 // --- Period helpers ---
 function getPeriodBounds(periodKey) {
@@ -303,18 +387,115 @@ function getUnbookedPeriods(reservations, fromDate, daysAhead = DEFAULT_UNBOOKED
   return out;
 }
 
-// --- Pacing tier: given final expected occupancy, return which tier (percentile range) ---
-function getPricingTier(finalExpectedOccupancy, tiers) {
+/**
+ * Pick target price percentile from pacing rows: sort thresholds descending, first row where
+ * finalExpected >= finalOccupancyPct wins. Include a 0% row as fallback.
+ */
+function resolvePacingTarget(finalExpectedOccupancy, rows) {
   const pct = Number(finalExpectedOccupancy);
-  if (isNaN(pct)) return null;
-  for (let i = 0; i < tiers.length; i++) {
-    const t = tiers[i];
-    const min = Number(t.minFinalOccupancy);
-    const max = Number(t.maxFinalOccupancy);
-    const inRange = max >= 100 ? (pct >= min && pct <= 100) : (pct >= min && pct < max);
-    if (inRange) return { ...t, tierClass: t.id };
+  if (!Number.isFinite(pct) || !rows || !rows.length) return null;
+  const valid = rows.filter(
+    (r) =>
+      r &&
+      Number.isFinite(Number(r.finalOccupancyPct)) &&
+      Number.isFinite(Number(r.targetPricePercentile))
+  );
+  if (!valid.length) return null;
+  const sorted = [...valid].sort((a, b) => Number(b.finalOccupancyPct) - Number(a.finalOccupancyPct));
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
+    const th = Number(r.finalOccupancyPct);
+    if (pct >= th) {
+      const tp = clampPct0to100(r.targetPricePercentile);
+      let low =
+        r.lowestPricePercentile != null && r.lowestPricePercentile !== ''
+          ? clampPct0to100(r.lowestPricePercentile)
+          : Math.max(0, tp - 30);
+      if (low > tp) low = tp;
+      const wks = r.weeksToStartReducing != null ? clampWeeksNonNeg(r.weeksToStartReducing) : 3;
+      const fin = finalizeLowerAndWeeksAhead(tp, low, wks, r.lowerPercentileTo, r.weeksAhead);
+      const weeksAhead = coalesceStoredWeeksAhead(r, fin.weeksAhead);
+      const id = String(r.id || `row-${i}`).replace(/[^a-zA-Z0-9_-]/g, '');
+      return {
+        targetPricePercentile: tp,
+        lowestPricePercentile: low,
+        weeksToStartReducing: wks,
+        lowerPercentileTo: fin.lowerPercentileTo,
+        weeksAhead,
+        thresholdFinalOcc: th,
+        tierClass: id || `row-${i}`,
+      };
+    }
   }
-  return tiers.length ? { ...tiers[tiers.length - 1], tierClass: tiers[tiers.length - 1].id } : null;
+  const last = sorted[sorted.length - 1];
+  const tpL = clampPct0to100(last.targetPricePercentile);
+  let lowL =
+    last.lowestPricePercentile != null && last.lowestPricePercentile !== ''
+      ? clampPct0to100(last.lowestPricePercentile)
+      : Math.max(0, tpL - 30);
+  if (lowL > tpL) lowL = tpL;
+  const wksL = last.weeksToStartReducing != null ? clampWeeksNonNeg(last.weeksToStartReducing) : 3;
+  const finL = finalizeLowerAndWeeksAhead(tpL, lowL, wksL, last.lowerPercentileTo, last.weeksAhead);
+  const weeksAheadL = coalesceStoredWeeksAhead(last, finL.weeksAhead);
+  return {
+    targetPricePercentile: tpL,
+    lowestPricePercentile: lowL,
+    weeksToStartReducing: wksL,
+    lowerPercentileTo: finL.lowerPercentileTo,
+    weeksAhead: weeksAheadL,
+    thresholdFinalOcc: Number(last.finalOccupancyPct),
+    tierClass: String(last.id || 'row-fallback').replace(/[^a-zA-Z0-9_-]/g, '') || 'row-fallback',
+  };
+}
+
+/**
+ * Ramp: ≥ wksR weeks out → target; at stay → lowest.
+ * If weeksAhead in (0, wksR) and lowerPercentileTo strictly between lowest and target: two segments
+ *   [wksR → weeksAhead]: target → lower; (weeksAhead → 0]: lower → lowest.
+ * Else single segment target → lowest over wksR.
+ */
+function computeEffectivePacingPercentile(tier, periodStartYmd, today) {
+  if (!tier || !periodStartYmd) return null;
+  const tgt = clampPct0to100(tier.targetPricePercentile);
+  const floor = clampPct0to100(tier.lowestPricePercentile);
+  const lo = Math.min(floor, tgt);
+  const wksR = clampWeeksNonNeg(tier.weeksToStartReducing);
+  if (wksR <= 0) return tgt;
+  const start = parseYMDToLocalNoon(periodStartYmd);
+  const t0 = new Date(today);
+  t0.setHours(12, 0, 0, 0);
+  if (!start || isNaN(start.getTime())) return tgt;
+  const daysUntil = (start.getTime() - t0.getTime()) / (24 * 60 * 60 * 1000);
+  const weeksUntil = daysUntil / 7;
+  if (weeksUntil >= wksR) return tgt;
+  if (weeksUntil <= 0) return lo;
+
+  const mid = clampPct0to100(tier.lowerPercentileTo);
+  const wa = clampWeeksNonNeg(tier.weeksAhead);
+  const twoPhase = wa > 0 && wa < wksR && mid > lo && mid < tgt;
+
+  if (!twoPhase) {
+    const u = weeksUntil / wksR;
+    return Math.round(lo + (tgt - lo) * u);
+  }
+
+  if (weeksUntil >= wa) {
+    const span = wksR - wa;
+    if (span <= 1e-9) return Math.round(mid);
+    const u = (weeksUntil - wa) / span;
+    return Math.round(mid + (tgt - mid) * u);
+  }
+  const u = wa <= 1e-9 ? 0 : weeksUntil / wa;
+  return Math.round(lo + (mid - lo) * u);
+}
+
+/** Color hint on recommended pricing percentile (Rec. Pctl %) column by target level */
+function pacingPercentileHeatClass(targetPct) {
+  const n = Number(targetPct);
+  if (!Number.isFinite(n)) return '';
+  if (n >= 75) return 'tier-high';
+  if (n >= 50) return 'tier-mid';
+  return 'tier-low';
 }
 
 /**
@@ -369,8 +550,13 @@ function getSampleMarketOccupancy(fromDate, weeksAhead = 14) {
     const weekEnd = new Date(weekStart);
     weekEnd.setDate(weekStart.getDate() + 6); // Thursday
     const key = formatLocalNoonToYMD(weekStart); // Friday key (local calendar, not UTC)
+    // Synthetic "last year same week" index (0–99) — used for price anchors only below.
     const lastYearSameWeek = (52 + w * 2 + (weekStart.getMonth() % 3) * 5) % 100;
-    const finalExpected = Math.min(92, Math.max(28, lastYearSameWeek + 35));
+    // Final expected occupancy: must NOT be mostly 91–92%. Old formula was
+    // clamp(lastYearSameWeek + 35, 28, 92) which hit the 92% cap whenever lastYearSameWeek ≥ 58.
+    // Spread ~34–90% in a stable, week-varying way (still fake sample data until PriceLabs).
+    const spreadSeed = (w * 19 + weekStart.getMonth() * 37 + (weekStart.getFullYear() % 4) * 11) % 61;
+    const finalExpected = Math.min(90, Math.max(34, 34 + spreadSeed));
     const progress = w / denom; // 0 = nearest Fri–Thu block, 1 = farthest in window
     // LYT: market booking level for this stay week on the same calendar date last year (pace snapshot).
     const lytFactor = 0.18 + 0.72 * Math.pow(progress, 1.12);
@@ -507,7 +693,13 @@ function getRecommendations(
       if (!tier) return;
       recs.push({
         type: 'action',
-        text: `Week of ${fp.periodStart}: Market final occupancy ${fp.finalExpected}% → price at ${tier.minPercentile}-${tier.maxPercentile} percentile (${tier.label}). ${fp.remainingPotential > 30 ? 'Good remaining demand—consider holding rate.' : 'Limited remaining demand—consider promotions.'}`,
+        text: `Week of ${fp.periodStart}: LY final ${fp.finalExpected}% → ~${tier.effectivePacingPercentile ?? tier.targetPricePercentile}th price pctl${
+          tier.weeksToStartReducing > 0
+            ? tier.weeksAhead > 0 && tier.lowerPercentileTo > tier.lowestPricePercentile
+              ? ` (Target ${tier.targetPricePercentile}% → Lower ${tier.lowerPercentileTo}% @ Wks to Lower ${tier.weeksAhead} → Lowest ${tier.lowestPricePercentile}% / Wks to Lowest ${tier.weeksToStartReducing})`
+              : ` (Target ${tier.targetPricePercentile}% → Lowest ${tier.lowestPricePercentile}% over Wks to Lowest ${tier.weeksToStartReducing})`
+            : ` (Target ${tier.targetPricePercentile}%)`
+        }. ${fp.remainingPotential > 30 ? 'Good remaining demand—consider holding rate.' : 'Limited remaining demand—consider promotions.'}`,
       });
     });
   }
@@ -537,7 +729,7 @@ function getRecommendations(
     });
   }
   if (recs.length === 0 && reservations.length > 0) {
-    recs.push({ type: 'ok', text: 'Pacing and occupancy look reasonable. Keep monitoring unbooked windows and market pacing tiers.' });
+    recs.push({ type: 'ok', text: 'Pacing and occupancy look reasonable. Keep monitoring unbooked windows and pacing rules.' });
   }
   return recs;
 }
@@ -1326,20 +1518,67 @@ function parseCSV(text) {
   return parseReservationsFromTableRows(csvTextToTableRows(text));
 }
 
-// --- Pacing tiers load/save ---
+// --- Pacing rows load/save (Final occupancy % threshold → Target price percentile) ---
+function normalizePacingRowsFromStorage(parsed) {
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  const first = parsed[0];
+  if (first && typeof first === 'object' && 'finalOccupancyPct' in first && 'targetPricePercentile' in first) {
+    return parsed.map((r, i) => {
+      const tp = clampPct0to100(r.targetPricePercentile);
+      let low =
+        r.lowestPricePercentile != null && r.lowestPricePercentile !== ''
+          ? clampPct0to100(r.lowestPricePercentile)
+          : Math.max(0, tp - 30);
+      if (low > tp) low = tp;
+      const wks = r.weeksToStartReducing != null ? clampWeeksNonNeg(r.weeksToStartReducing) : 3;
+      const finN = finalizeLowerAndWeeksAhead(tp, low, wks, r.lowerPercentileTo, r.weeksAhead);
+      const weeksAheadN = coalesceStoredWeeksAhead(r, finN.weeksAhead);
+      return {
+        id: String(r.id != null && String(r.id).trim() !== '' ? r.id : `row-${i}`),
+        finalOccupancyPct: clampPct0to100(r.finalOccupancyPct),
+        targetPricePercentile: tp,
+        lowestPricePercentile: low,
+        weeksToStartReducing: wks,
+        lowerPercentileTo: finN.lowerPercentileTo,
+        weeksAhead: weeksAheadN,
+      };
+    });
+  }
+  return null;
+}
+
 function loadPacingTiers() {
-  const raw = localStorage.getItem(STORAGE_KEYS.pacingTiers);
-  if (!raw) return JSON.parse(JSON.stringify(DEFAULT_PACING_TIERS));
+  const raw = localStorage.getItem(STORAGE_KEYS.pacingRows);
+  if (!raw) return JSON.parse(JSON.stringify(DEFAULT_PACING_ROWS));
   try {
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.length ? parsed : JSON.parse(JSON.stringify(DEFAULT_PACING_TIERS));
+    const norm = normalizePacingRowsFromStorage(parsed);
+    return norm && norm.length ? norm : JSON.parse(JSON.stringify(DEFAULT_PACING_ROWS));
   } catch {
-    return JSON.parse(JSON.stringify(DEFAULT_PACING_TIERS));
+    return JSON.parse(JSON.stringify(DEFAULT_PACING_ROWS));
   }
 }
 
-function savePacingTiers(tiers) {
-  localStorage.setItem(STORAGE_KEYS.pacingTiers, JSON.stringify(tiers));
+function savePacingTiers(rows) {
+  localStorage.setItem(STORAGE_KEYS.pacingRows, JSON.stringify(rows));
+}
+
+/** Defaults used by Reset (and empty-table fallback): saved template or built-in factory defaults. */
+function loadUserPacingDefaults() {
+  const raw = localStorage.getItem(STORAGE_KEYS.pacingRowsDefaults);
+  if (!raw) return JSON.parse(JSON.stringify(DEFAULT_PACING_ROWS));
+  try {
+    const parsed = JSON.parse(raw);
+    const norm = normalizePacingRowsFromStorage(parsed);
+    if (norm && norm.length) return norm;
+  } catch {
+    /* ignore */
+  }
+  return JSON.parse(JSON.stringify(DEFAULT_PACING_ROWS));
+}
+
+function saveUserPacingDefaults(rows) {
+  localStorage.setItem(STORAGE_KEYS.pacingRowsDefaults, JSON.stringify(rows));
 }
 
 function buildFuturePeriodsWithMarket(reservations, pacingTiers, horizonDays) {
@@ -1375,7 +1614,18 @@ function buildFuturePeriodsWithMarket(reservations, pacingTiers, horizonDays) {
     if (finalExpected != null && lastYearTodayOccupancy != null) {
       remainingPotentialLY = Math.max(0, finalExpected - lastYearTodayOccupancy);
     }
-    const tier = finalExpected != null && pacingTiers && pacingTiers.length ? getPricingTier(finalExpected, pacingTiers) : null;
+    const tierBase =
+      finalExpected != null && pacingTiers && pacingTiers.length
+        ? resolvePacingTarget(finalExpected, pacingTiers)
+        : null;
+    const effectivePacingPercentile =
+      tierBase && p.periodStart
+        ? computeEffectivePacingPercentile(tierBase, p.periodStart, today)
+        : null;
+    const tier =
+      tierBase != null
+        ? { ...tierBase, effectivePacingPercentile }
+        : null;
     const finalPrice = market ? market.finalPrice : null;
     const priceP25 = market ? market.priceP25 : null;
     const priceP50 = market ? market.priceP50 : null;
@@ -1878,12 +2128,24 @@ function render(reservations, periodKey, revenueTarget) {
           const p75Str = formatMoneyWhole(fp.priceP75) ?? '—';
           const p90Str = formatMoneyWhole(fp.priceP90) ?? '—';
           const tier = fp.tier;
-          const pctStr = tier ? `${tier.minPercentile}-${tier.maxPercentile}%` : '—';
-          const tierTitle = tier ? `${tier.minPercentile}-${tier.maxPercentile}% · ${tier.label}` : '';
+          const eff = tier ? tier.effectivePacingPercentile ?? tier.targetPricePercentile : null;
+          const pctStr = tier && eff != null ? `${eff}%` : '—';
+          const tierTitle = tier
+            ? `Suggested ${eff}% · LY final ≥ ${tier.thresholdFinalOcc}% · ${
+                tier.weeksToStartReducing > 0
+                  ? tier.weeksAhead > 0 &&
+                    tier.lowerPercentileTo > tier.lowestPricePercentile &&
+                    tier.lowerPercentileTo < tier.targetPricePercentile
+                    ? `Target ${tier.targetPricePercentile}% → Lower ${tier.lowerPercentileTo}% (Wks to Lower ${tier.weeksAhead}) → Lowest ${tier.lowestPricePercentile}% (Wks to Lowest ${tier.weeksToStartReducing})`
+                    : `Target ${tier.targetPricePercentile}% → Lowest ${tier.lowestPricePercentile}% (Wks to Lowest ${tier.weeksToStartReducing})`
+                  : 'no time ramp'
+              }`
+            : '';
           const tierTitleAttr = tierTitle
             ? ` title="${tierTitle.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"`
             : '';
-          const tierClass = tier ? `tier-${tier.tierClass} pct-cell` : 'pct-cell';
+          const heat = tier && eff != null ? pacingPercentileHeatClass(eff) : '';
+          const tierClass = tier ? `pct-cell ${heat}` : 'pct-cell';
           const dowRange = formatDowRange(fp.periodStart, fp.periodEnd);
           const periodCompact = formatFuturePacingPeriodCompact(fp.periodStart, fp.periodEnd);
           const periodTitle = `${fp.periodStart} – ${fp.periodEnd}`;
@@ -2211,9 +2473,45 @@ function init() {
     render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
   });
   document.getElementById('resetPacingSettings').addEventListener('click', () => {
-    savePacingTiers(JSON.parse(JSON.stringify(DEFAULT_PACING_TIERS)));
-    populateTiersTable(DEFAULT_PACING_TIERS);
+    const defs = JSON.parse(JSON.stringify(loadUserPacingDefaults()));
+    savePacingTiers(defs);
+    populateTiersTable(defs);
     render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+  });
+
+  document.getElementById('savePacingDefaults')?.addEventListener('click', () => {
+    savePacingDefaultsFromForm();
+    const btn = document.getElementById('savePacingDefaults');
+    if (btn) {
+      const prev = btn.textContent;
+      btn.textContent = 'Saved as defaults';
+      btn.disabled = true;
+      setTimeout(() => {
+        btn.textContent = prev;
+        btn.disabled = false;
+      }, 1600);
+    }
+  });
+
+  document.getElementById('addPacingRow')?.addEventListener('click', () => {
+    appendPacingRowToTable({
+      id: newPacingRowId(),
+      finalOccupancyPct: 0,
+      targetPricePercentile: 50,
+      lowestPricePercentile: 35,
+      weeksToStartReducing: 3,
+      lowerPercentileTo: 42,
+      weeksAhead: 1,
+    });
+  });
+
+  document.getElementById('tiersTableBody')?.addEventListener('click', (e) => {
+    const btn = e.target.closest('.btn-row-delete');
+    if (!btn) return;
+    const tr = btn.closest('tr');
+    const tbody = document.getElementById('tiersTableBody');
+    if (!tr || !tbody || tbody.querySelectorAll('tr').length <= 1) return;
+    tr.remove();
   });
   document.getElementById('settingsOverlay').addEventListener('click', (e) => {
     if (e.target.id === 'settingsOverlay') e.target.hidden = true;
@@ -2232,55 +2530,114 @@ function openPacingSettingsModal() {
   document.getElementById('settingsOverlay').hidden = false;
 }
 
-function populateTiersTable(tiers) {
+function pacingRowHtml(r) {
+  const id = String(r.id || newPacingRowId()).replace(/"/g, '');
+  const fo = clampPct0to100(r.finalOccupancyPct);
+  const tp = clampPct0to100(r.targetPricePercentile);
+  let low =
+    r.lowestPricePercentile != null && r.lowestPricePercentile !== ''
+      ? clampPct0to100(r.lowestPricePercentile)
+      : Math.max(0, tp - 30);
+  if (low > tp) low = tp;
+  const wks = r.weeksToStartReducing != null ? clampWeeksNonNeg(r.weeksToStartReducing) : 3;
+  const fin = finalizeLowerAndWeeksAhead(tp, low, wks, r.lowerPercentileTo, r.weeksAhead);
+  const lp = fin.lowerPercentileTo;
+  // Must show stored Wks to Lower, not fin.weeksAhead (finalize often zeros it for curve rules).
+  const wa = coalesceStoredWeeksAhead(r, fin.weeksAhead);
+  return `
+    <tr data-row-id="${id}">
+      <td>
+        <input type="number" min="0" max="100" step="1" value="${fo}" data-field="finalOccupancyPct" title="LY final at or above this % → use this row" />
+      </td>
+      <td>
+        <input type="number" min="0" max="100" step="1" value="${tp}" data-field="targetPricePercentile" title="Target Pctl % when stay is ≥ Wks to Lowest away" />
+      </td>
+      <td>
+        <input type="number" min="0" max="100" step="1" value="${lp}" data-field="lowerPercentileTo" title="Lower Pctl % — between Target and Lowest (two-step ramp)" />
+      </td>
+      <td>
+        <input class="tiers-input-wide" type="number" min="0" max="104" step="1" value="${wa}" data-field="weeksAhead" title="Wks to Lower — weeks before stay when ramp hits Lower Pctl; 0 = one-step to Lowest" />
+      </td>
+      <td>
+        <input type="number" min="0" max="100" step="1" value="${low}" data-field="lowestPricePercentile" title="Lowest Pctl% at first night of stay" />
+      </td>
+      <td>
+        <input class="tiers-input-wide" type="number" min="0" max="104" step="1" value="${wks}" data-field="weeksToStartReducing" title="Wks to Lowest — start ramp from Target; 0 = always Target" />
+      </td>
+      <td>
+        <button type="button" class="btn-row-delete btn-small" aria-label="Delete row">&times;</button>
+      </td>
+    </tr>`;
+}
+
+function appendPacingRowToTable(row) {
   const tbody = document.getElementById('tiersTableBody');
   if (!tbody) return;
-  tbody.innerHTML = tiers
-    .map(
-      (t, i) => `
-    <tr data-tier-id="${t.id || i}">
-      <td>
-        <div class="tier-range">
-          <input type="number" min="0" max="100" value="${t.minFinalOccupancy}" data-field="minFinalOccupancy" />
-          <span>% to</span>
-          <input type="number" min="0" max="100" value="${t.maxFinalOccupancy}" data-field="maxFinalOccupancy" />
-          <span>%</span>
-        </div>
-      </td>
-      <td>
-        <div class="tier-range">
-          <input type="number" min="0" max="100" value="${t.minPercentile}" data-field="minPercentile" />
-          <span>–</span>
-          <input type="number" min="0" max="100" value="${t.maxPercentile}" data-field="maxPercentile" />
-          <span>%</span>
-        </div>
-      </td>
-    </tr>`
-    )
-    .join('');
+  const wrap = document.createElement('tbody');
+  wrap.innerHTML = pacingRowHtml(row).trim();
+  const tr = wrap.querySelector('tr');
+  if (tr) tbody.appendChild(tr);
+}
+
+function populateTiersTable(rows) {
+  const tbody = document.getElementById('tiersTableBody');
+  if (!tbody) return;
+  const sorted = [...rows].sort((a, b) => Number(b.finalOccupancyPct) - Number(a.finalOccupancyPct));
+  tbody.innerHTML = sorted.map((r) => pacingRowHtml(r)).join('');
+}
+
+/** Read pacing rows from the modal table (empty → []). */
+function readPacingRowsFromFormBody(tbody) {
+  const trs = tbody.querySelectorAll('tr');
+  const newRows = [];
+  trs.forEach((row) => {
+    const fo = row.querySelector('[data-field="finalOccupancyPct"]');
+    const tp = row.querySelector('[data-field="targetPricePercentile"]');
+    const lo = row.querySelector('[data-field="lowestPricePercentile"]');
+    const wk = row.querySelector('[data-field="weeksToStartReducing"]');
+    const lpIn = row.querySelector('[data-field="lowerPercentileTo"]');
+    const waIn = row.querySelector('[data-field="weeksAhead"]');
+    const rid = row.dataset.rowId || newPacingRowId();
+    let tpp = clampPct0to100(tp ? tp.value : 0);
+    let low = clampPct0to100(lo ? lo.value : Math.max(0, tpp - 30));
+    if (low > tpp) low = tpp;
+    const wksV = wk != null ? clampWeeksNonNeg(wk.value) : 3;
+    const fin = finalizeLowerAndWeeksAhead(tpp, low, wksV, lpIn ? lpIn.value : null, waIn ? waIn.value : null);
+    const weeksAheadStored = coalesceStoredWeeksAhead(
+      waIn != null && waIn.value !== '' ? { weeksAhead: waIn.value } : {},
+      fin.weeksAhead
+    );
+    newRows.push({
+      id: rid,
+      finalOccupancyPct: clampPct0to100(fo ? fo.value : 0),
+      targetPricePercentile: tpp,
+      lowestPricePercentile: low,
+      weeksToStartReducing: wksV,
+      lowerPercentileTo: fin.lowerPercentileTo,
+      weeksAhead: weeksAheadStored,
+    });
+  });
+  return newRows;
 }
 
 function savePacingSettingsFromForm() {
   const tbody = document.getElementById('tiersTableBody');
   if (!tbody) return;
-  const tiers = loadPacingTiers();
-  const rows = tbody.querySelectorAll('tr');
-  const newTiers = [];
-  rows.forEach((row, i) => {
-    const minFinal = row.querySelector('[data-field="minFinalOccupancy"]');
-    const maxFinal = row.querySelector('[data-field="maxFinalOccupancy"]');
-    const minPct = row.querySelector('[data-field="minPercentile"]');
-    const maxPct = row.querySelector('[data-field="maxPercentile"]');
-    const base = tiers[i] || { id: `tier-${i}`, label: ['High demand', 'Mid demand', 'Low demand'][i] || 'Tier' };
-    newTiers.push({
-      ...base,
-      minFinalOccupancy: minFinal ? parseInt(minFinal.value, 10) || 0 : base.minFinalOccupancy,
-      maxFinalOccupancy: maxFinal ? parseInt(maxFinal.value, 10) || 100 : base.maxFinalOccupancy,
-      minPercentile: minPct ? parseInt(minPct.value, 10) || 0 : base.minPercentile,
-      maxPercentile: maxPct ? parseInt(maxPct.value, 10) || 100 : base.maxPercentile,
-    });
-  });
-  if (newTiers.length) savePacingTiers(newTiers);
+  let rows = readPacingRowsFromFormBody(tbody);
+  if (rows.length === 0) {
+    rows = JSON.parse(JSON.stringify(loadUserPacingDefaults()));
+    populateTiersTable(rows);
+  }
+  savePacingTiers(rows);
+}
+
+/** Persist current table as the template used by “Reset to defaults”. */
+function savePacingDefaultsFromForm() {
+  const tbody = document.getElementById('tiersTableBody');
+  if (!tbody) return;
+  let rows = readPacingRowsFromFormBody(tbody);
+  if (rows.length === 0) rows = JSON.parse(JSON.stringify(loadUserPacingDefaults()));
+  saveUserPacingDefaults(rows);
 }
 
 init();

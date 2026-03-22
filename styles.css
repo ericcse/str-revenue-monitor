@@ -562,6 +562,10 @@ body {
   overflow-y: auto;
 }
 
+.modal-overlay .modal.modal-pacing-settings {
+  max-width: min(1100px, 98vw);
+}
+
 .modal-header {
   display: flex;
   align-items: center;
@@ -630,6 +634,53 @@ body {
 
 .tiers-table .tier-range span {
   color: var(--text-muted);
+}
+
+.tiers-table-pacing th,
+.tiers-table-pacing td {
+  vertical-align: middle;
+}
+
+.tiers-table-pacing input[type='number'] {
+  width: 4.5rem;
+  max-width: 100%;
+  padding: 0.4rem 0.45rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.8125rem;
+}
+
+.tiers-table-pacing .tiers-input-wide {
+  width: 3.75rem;
+}
+
+.tiers-actions-col {
+  width: 3rem;
+  text-align: center;
+}
+
+.btn-row-delete {
+  min-width: 2rem;
+  padding: 0.25rem 0.45rem;
+  line-height: 1;
+  font-size: 1.1rem;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.btn-row-delete:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.tiers-modal-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
 }
 
 /* Top CSV drop zone (market pacing + optional booking CSV) */

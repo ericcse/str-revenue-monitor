@@ -183,7 +183,7 @@
                 <th title="50th percentile (median) market price">P50</th>
                 <th title="75th percentile market price">P75</th>
                 <th title="90th percentile market price">P90</th>
-                <th title="Suggested price percentile band">Pctl</th>
+                <th title="Recommended Pricing Percentile % — suggested from pacing (target → lowest as stay approaches, per settings)">Rec. Pctl %</th>
               </tr>
             </thead>
             <tbody id="futurePacingBody"></tbody>
@@ -211,26 +211,39 @@
 
       <!-- Settings modal -->
       <div class="modal-overlay" id="settingsOverlay" hidden>
-        <div class="modal card">
+        <div class="modal card modal-pacing-settings">
           <div class="modal-header">
             <h2>Pacing settings</h2>
             <button type="button" class="modal-close" id="closeSettings" aria-label="Close">&times;</button>
           </div>
-          <p class="card-desc">Map market final expected occupancy to your target price percentile. When the market is expected to be full (e.g. ≥75%), price at the top of the market; when demand is lower, price in a lower band. Later: pull from PriceLabs when available.</p>
+          <p class="card-desc">
+            Each row is a <strong>threshold</strong>: when <strong>LY final</strong> is <strong>at or above</strong> <strong>Final Occ. %</strong>, that row applies.
+            From <strong>Wks to Lowest</strong> weeks before the stay: ramp <strong>Target → Lower Pctl %</strong> by <strong>Wks to Lower</strong> weeks out, then <strong>Lower → Lowest Pctl%</strong> by the first night.
+            Set <strong>Wks to Lower</strong> to <strong>0</strong> or <strong>≥ Wks to Lowest</strong> for one straight ramp Target → Lowest. <strong>0</strong> on <strong>Wks to Lowest</strong> = always Target.
+          </p>
           <div class="tiers-editor">
-            <table class="tiers-table">
+            <table class="tiers-table tiers-table-pacing">
               <thead>
                 <tr>
-                  <th>When final occupancy is</th>
-                  <th>Price at percentile</th>
+                  <th title="LY final expected % at or above this → use this row">Final Occ. %</th>
+                  <th title="Price percentile when stay is at least Wks to Lowest away">Target Pctl %</th>
+                  <th title="Intermediate step between Target and Lowest Pctl%">Lower Pctl %</th>
+                  <th title="Weeks before stay when ramp reaches Lower; 0 = skip two-step (straight to Lowest)">Wks to Lower</th>
+                  <th title="Floor percentile at first night of stay">Lowest Pctl%</th>
+                  <th title="Weeks before stay to start ramp from Target; 0 = always use Target">Wks to Lowest</th>
+                  <th class="tiers-actions-col" aria-hidden="true"></th>
                 </tr>
               </thead>
               <tbody id="tiersTableBody">
                 <!-- filled by JS -->
               </tbody>
             </table>
-            <div class="modal-actions">
+            <div class="modal-actions tiers-modal-actions">
+              <button type="button" id="addPacingRow" class="btn-secondary">Add row</button>
               <button type="button" id="savePacingSettings" class="upload-btn">Save settings</button>
+              <button type="button" id="savePacingDefaults" class="btn-secondary" title="Store current rows as the template for Reset to defaults">
+                Save as defaults
+              </button>
               <button type="button" id="resetPacingSettings" class="btn-secondary">Reset to defaults</button>
             </div>
           </div>
