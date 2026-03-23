@@ -5,7 +5,6 @@
 
 const STORAGE_KEYS = {
   revenueTarget: 'str-monitor-revenue-target',
-  period: 'str-monitor-period',
   reservations: 'str-monitor-reservations',
   /** Two-column pacing rules (replaces legacy range-based tiers). */
   pacingRows: 'str-monitor-pacing-rows',
@@ -13,7 +12,14 @@ const STORAGE_KEYS = {
   pacingRowsDefaults: 'str-monitor-pacing-rows-defaults',
   unbookedHorizonDays: 'str-monitor-unbooked-horizon-days',
   marketPacing: 'str-monitor-market-pacing',
+  /** ISO 8601 instant when reservations were last loaded from Hospitable (client clock). */
+  hospitableAsOf: 'str-monitor-hospitable-as-of',
+  /** Future pacing table: extra columns visible (Cur, LYT, Rm LY, P25–P90). */
+  futurePacingTableDetailsVisible: 'str-monitor-future-table-details',
 };
+
+/** Revenue/pacing cards use this calendar window (month = current month only). */
+const PACING_PERIOD_KEY = 'month';
 
 /** Allowed unbooked lookahead windows (≈ calendar months). Default 4 months. */
 const UNBOOKED_HORIZON_OPTIONS = [30, 120, 180, 270, 365];
@@ -90,11 +96,19 @@ function clampPct0to100(n) {
   return Math.max(0, Math.min(100, x));
 }
 
-/** Weeks before stay to start ramping target → lowest (0 = always use target). */
+/** Weeks before stay to start ramping target → lowest (0 = always use target). One decimal place. */
 function clampWeeksNonNeg(n) {
-  const x = Math.round(Number(n));
+  const x = Number(n);
   if (!Number.isFinite(x) || x < 0) return 0;
-  return Math.min(104, x);
+  const r = Math.round(x * 10) / 10;
+  return Math.min(104, r);
+}
+
+/** Wks to Lower / Wks to Lowest shown with exactly one decimal (e.g. 3 → 3.0). */
+function formatWeeksOneDecimal(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '—';
+  return (Math.round(x * 10) / 10).toFixed(1);
 }
 
 function newPacingRowId() {
@@ -129,7 +143,7 @@ function finalizeLowerAndWeeksAhead(tp, low, wks, lowerRaw, weeksAheadRaw) {
 
 /**
  * After linear blend of pacing rows: **always keep the lerped Wks to Lower** for display/tooltip.
- * Pricing uses computeEffectivePacingPercentile: two-phase only when wa < wksR and mid is strictly
+ * Pricing uses computeRecPctlPercentileFromWksAway: bands from Wks Away vs Wks to Lower / Wks to Lowest.
  * between loRamp and tgt; if wa >= wksR (or lower invalid), ramp is single-segment — no need to
  * shrink wa to wksR−1 (that broke e.g. lerp 6→12 with small Wks to Lowest).
  */
@@ -149,7 +163,7 @@ function mergeInterpolatedLowerAndWeeksAhead(tpC, lowC, wksC, lowerInterp, weeks
   let lower = clampPct0to100(lowerInterp);
   lower = Math.max(floor, Math.min(lower, tgt));
 
-  // Same two-phase validity as computeEffectivePacingPercentile
+  // Same mid-step validity as legacy two-phase ramp (used when normalizing rows)
   if (wa < wksR && lower > loRamp && lower < tgt) {
     return { lowerPercentileTo: lower, weeksAhead: wa };
   }
@@ -170,7 +184,7 @@ function mergeInterpolatedLowerAndWeeksAhead(tpC, lowC, wksC, lowerInterp, weeks
 /**
  * Keep row.weeksAhead (Wks to Lower) when the user saved it. finalizeLowerAndWeeksAhead() may zero it
  * for curve math, but that must not erase values on Save / Save as defaults / load from storage.
- * computeEffectivePacingPercentile() already ignores two-phase when values are invalid.
+ * Saved Wks to Lower is preserved for the table formula even when finalize zeros it for curve rules.
  */
 function coalesceStoredWeeksAhead(row, finWeeksAhead) {
   if (!row) return finWeeksAhead;
@@ -472,10 +486,21 @@ function buildPacingInterpolationAnchors(rows) {
   return sortedPairs.map(([th, r], i) => tierFromPacingRow(r, i));
 }
 
+/** Footer lines: how Rec. Pctl % is computed (shown in cell tooltip). */
+function buildRecPctlFormulaTooltipLines() {
+  return [
+    '—',
+    'Formula:',
+    'If Wks Away ≥ max(Wks to Lower, Wks to Lowest) → Target Pctl %.',
+    'If min(Wks to Lower, Wks to Lowest) ≤ Wks Away < max(...) → Rec = Target + u × (Lower Pctl − Target), u = (Wks Away − Wks to Lower) ÷ (Wks to Lowest − Wks to Lower), u clamped to [0, 1] (linear in Wks Away between (Wks to Lower, Target) and (Wks to Lowest, Lower Pctl)).',
+    'If Wks Away < min(Wks to Lower, Wks to Lowest) → Rec = Lower Pctl + v × (Lowest Pctl − Lower Pctl), v = (Wks to Lowest − Wks Away) ÷ Wks to Lowest, v clamped to [0, 1] (linear in Wks Away between (Wks to Lowest, Lower Pctl) and (0, Lowest Pctl)).',
+  ];
+}
+
 /**
- * Hover text for Rec. Pctl %: interpolated pacing settings from LY final vs Final Occ. % rows.
+ * Hover text for Rec. Pctl %: tier inputs, Wks Away / LY Fin context, and formula.
  */
-function buildRecPctlCellTitle(tier, effectivePct) {
+function buildRecPctlCellTitle(tier, effectivePct, meta = {}) {
   if (!tier) return '';
   const lines = [];
   if (tier.pacingInterpolatedLyFinal != null && Number.isFinite(tier.pacingInterpolatedLyFinal)) {
@@ -486,20 +511,28 @@ function buildRecPctlCellTitle(tier, effectivePct) {
   }
   lines.push(`Target Pctl %: ${tier.targetPricePercentile}`);
   lines.push(`Lower Pctl %: ${tier.lowerPercentileTo}`);
-  lines.push(`Wks to Lower: ${tier.weeksAhead}`);
+  lines.push(`Wks to Lower: ${formatWeeksOneDecimal(tier.weeksAhead)}`);
   lines.push(`Lowest Pctl%: ${tier.lowestPricePercentile}`);
-  lines.push(`Wks to Lowest: ${tier.weeksToStartReducing}`);
+  lines.push(`Wks to Lowest: ${formatWeeksOneDecimal(tier.weeksToStartReducing)}`);
+  if (meta.wksAway != null && Number.isFinite(Number(meta.wksAway))) {
+    lines.push(`Wks Away: ${formatWeeksOneDecimal(meta.wksAway)}`);
+  }
+  if (meta.lyFinPct != null && Number.isFinite(Number(meta.lyFinPct))) {
+    const lyStr = formatPctWhole(meta.lyFinPct);
+    lines.push(`LY Fin: ${lyStr != null ? lyStr : '—'}`);
+  }
   if (effectivePct != null && Number.isFinite(Number(effectivePct))) {
     lines.push('—');
-    lines.push(`Rec. Pctl % (this stay): ${effectivePct}%`);
+    lines.push(`Rec. Pctl % (this period): ${effectivePct}%`);
   }
+  lines.push(...buildRecPctlFormulaTooltipLines());
   return escapeHtmlAttr(lines.join('\n')).replace(/\n/g, '&#10;');
 }
 
 /**
  * Resolve pacing tier from LY final expected occupancy: linear interpolation on **Final Occ. %**
- * between pacing rows for Target / Lower / Wks to Lower / Lowest / Wks to Lowest, then time-based
- * ramp yields Rec. Pctl % for each stay week.
+ * between pacing rows for Target / Lower / Wks to Lower / Lowest / Wks to Lowest.
+ * Rec. Pctl % in the Future table uses Wks Away vs those week thresholds (see computeRecPctlPercentileFromWksAway).
  */
 function resolvePacingTarget(finalExpectedOccupancy, rows) {
   const pct = Number(finalExpectedOccupancy);
@@ -538,15 +571,14 @@ function resolvePacingTarget(finalExpectedOccupancy, rows) {
     const lowI = Math.round(
       L.lowestPricePercentile + (R.lowestPricePercentile - L.lowestPricePercentile) * u
     );
-    const wksR = Math.round(
+    const wksC = clampWeeksNonNeg(
       L.weeksToStartReducing + (R.weeksToStartReducing - L.weeksToStartReducing) * u
     );
     const lowerI = Math.round(L.lowerPercentileTo + (R.lowerPercentileTo - L.lowerPercentileTo) * u);
-    const wksA = Math.round(L.weeksAhead + (R.weeksAhead - L.weeksAhead) * u);
+    const wksA = clampWeeksNonNeg(L.weeksAhead + (R.weeksAhead - L.weeksAhead) * u);
     const tpC = clampPct0to100(tp);
     let lowC = clampPct0to100(lowI);
     if (lowC > tpC) lowC = tpC;
-    const wksC = clampWeeksNonNeg(wksR);
     const fin = mergeInterpolatedLowerAndWeeksAhead(tpC, lowC, wksC, lowerI, wksA);
     return withLy({
       targetPricePercentile: tpC,
@@ -563,44 +595,109 @@ function resolvePacingTarget(finalExpectedOccupancy, rows) {
 }
 
 /**
- * Ramp: ≥ wksR weeks out → target; at stay → lowest.
- * If weeksAhead in (0, wksR) and lowerPercentileTo strictly between lowest and target: two segments
- *   [wksR → weeksAhead]: target → lower; (weeksAhead → 0]: lower → lowest.
- * Else single segment target → lowest over wksR.
+ * Rec. Pctl % for a future period: **Wks Away** (as-of → period start) vs Wks to Lower / Wks to Lowest.
+ * Beyond the farther week threshold → Target. Between the two thresholds → linear in Wks Away from
+ * (Wks to Lower, Target Pctl) to (Wks to Lowest, Lower Pctl): u = (Wks Away − Wks to Lower) / (Wks to Lowest − Wks to Lower).
+ * Below min(Wks to Lower, Wks to Lowest) → linear in Wks Away from (Wks to Lowest, Lower Pctl) to (0, Lowest Pctl).
  */
-function computeEffectivePacingPercentile(tier, periodStartYmd, today) {
-  if (!tier || !periodStartYmd) return null;
+function computeRecPctlPercentileFromWksAway(tier, wksAway, _lyFinPct) {
+  if (!tier || wksAway == null || !Number.isFinite(Number(wksAway))) return null;
   const tgt = clampPct0to100(tier.targetPricePercentile);
+  const lower = clampPct0to100(tier.lowerPercentileTo);
   const floor = clampPct0to100(tier.lowestPricePercentile);
-  const lo = Math.min(floor, tgt);
-  const wksR = clampWeeksNonNeg(tier.weeksToStartReducing);
-  if (wksR <= 0) return tgt;
-  const start = parseYMDToLocalNoon(periodStartYmd);
-  const t0 = new Date(today);
-  t0.setHours(12, 0, 0, 0);
-  if (!start || isNaN(start.getTime())) return tgt;
-  const daysUntil = (start.getTime() - t0.getTime()) / (24 * 60 * 60 * 1000);
-  const weeksUntil = daysUntil / 7;
-  if (weeksUntil >= wksR) return tgt;
-  if (weeksUntil <= 0) return lo;
+  const wL = clampWeeksNonNeg(tier.weeksAhead);
+  const wF = clampWeeksNonNeg(tier.weeksToStartReducing);
+  const hi = Math.max(wL, wF);
+  const lo = Math.min(wL, wF);
 
-  const mid = clampPct0to100(tier.lowerPercentileTo);
-  const wa = clampWeeksNonNeg(tier.weeksAhead);
-  const twoPhase = wa > 0 && wa < wksR && mid > lo && mid < tgt;
+  if (wksAway >= hi) return Math.round(tgt);
 
-  if (!twoPhase) {
-    const u = weeksUntil / wksR;
-    return Math.round(lo + (tgt - lo) * u);
+  if (wksAway < lo) {
+    if (wF <= 1e-9) return Math.round(floor);
+    const v = Math.max(0, Math.min(1, (wF - wksAway) / wF));
+    return Math.round(clampPct0to100(lower + v * (floor - lower)));
   }
 
-  if (weeksUntil >= wa) {
-    const span = wksR - wa;
-    if (span <= 1e-9) return Math.round(mid);
-    const u = (weeksUntil - wa) / span;
-    return Math.round(mid + (tgt - mid) * u);
+  const denom = wF - wL;
+  if (Math.abs(denom) <= 1e-9) return Math.round(tgt);
+  let u = (wksAway - wL) / denom;
+  u = Math.max(0, Math.min(1, u));
+  return Math.round(clampPct0to100(tgt + u * (lower - tgt)));
+}
+
+/** Mini number line: T/L/F = Target, Lower, Lowest; arrow = resolved Rec. Pctl % (when present). */
+function buildRecPctlNumberLineHtml(tier, recPctResolved) {
+  if (!tier) return '<span class="rec-pctl-line-empty" aria-hidden="true">—</span>';
+  const tgt = clampPct0to100(tier.targetPricePercentile);
+  const lower = clampPct0to100(tier.lowerPercentileTo);
+  const floor = clampPct0to100(tier.lowestPricePercentile);
+  const hasRec = recPctResolved != null && Number.isFinite(Number(recPctResolved));
+  const rec = hasRec ? clampPct0to100(recPctResolved) : null;
+
+  const VB_W = 200;
+  const VB_H = 60;
+  const PAD = 10;
+  const BAR_Y = 26;
+  const yMark = 34;
+  const yWks = 44;
+  const yNum = 56;
+  const innerW = VB_W - 2 * PAD;
+  /** Map percentile to x: higher % on the left, lower % on the right (mirrored 0–100). */
+  const toX = (p) => VB_W - PAD - (clampPct0to100(p) / 100) * innerW;
+
+  const xT = toX(tgt);
+  const xL = toX(lower);
+  const xF = toX(floor);
+  const wToLowerStr = formatWeeksOneDecimal(clampWeeksNonNeg(tier.weeksAhead));
+  const wToLowestStr = formatWeeksOneDecimal(clampWeeksNonNeg(tier.weeksToStartReducing));
+
+  const anchors = [
+    { pct: tgt, mark: 'T', tip: `Target ${tgt}%` },
+    { pct: lower, mark: 'L', tip: `Lower ${lower}%` },
+    { pct: floor, mark: 'F', tip: `Lowest ${floor}%` },
+  ];
+
+  const tipSuffix = hasRec ? ` · Arrow: Rec. ${rec}%` : '';
+  let html = `<div class="rec-pctl-line-wrap" title="T = Target · L = Lower · F = Lowest · scale: high % left, low % right${tipSuffix}">`;
+  html += `<svg class="rec-pctl-line" viewBox="0 0 ${VB_W} ${VB_H}" xmlns="http://www.w3.org/2000/svg" focusable="false" aria-hidden="true">`;
+  html += `<line class="rec-pctl-line__axis" x1="${PAD}" y1="${BAR_Y}" x2="${VB_W - PAD}" y2="${BAR_Y}"/>`;
+
+  for (const a of anchors) {
+    const x = toX(a.pct);
+    html += `<g class="rec-pctl-line__anchor">`;
+    html += `<title>${a.tip.replace(/&/g, '&amp;')}</title>`;
+    html += `<line class="rec-pctl-line__tick rec-pctl-line__tick--${a.mark === 'T' ? 'target' : a.mark === 'L' ? 'lower' : 'lowest'}" x1="${x}" y1="${BAR_Y - 8}" x2="${x}" y2="${BAR_Y + 8}"/>`;
+    html += `<text class="rec-pctl-line__mark" x="${x}" y="${yMark}" text-anchor="middle" dominant-baseline="middle">${a.mark}</text>`;
+    html += `<text class="rec-pctl-line__num" x="${x}" y="${yNum}" text-anchor="middle" dominant-baseline="middle">${a.pct}</text>`;
+    html += `</g>`;
   }
-  const u = wa <= 1e-9 ? 0 : weeksUntil / wa;
-  return Math.round(lo + (mid - lo) * u);
+
+  if (Math.abs(xT - xL) > 2) {
+    const xMid = (xT + xL) / 2;
+    html += `<g class="rec-pctl-line__wks-gap">`;
+    html += `<title>Wks to Lower: ${wToLowerStr} (between Target and Lower)</title>`;
+    html += `<text class="rec-pctl-line__wks-val" x="${xMid}" y="${yWks}" text-anchor="middle">${wToLowerStr}</text>`;
+    html += `</g>`;
+  }
+  if (Math.abs(xL - xF) > 2) {
+    const xMid = (xL + xF) / 2;
+    html += `<g class="rec-pctl-line__wks-gap">`;
+    html += `<title>Wks to Lowest: ${wToLowestStr} (between Lower and Lowest)</title>`;
+    html += `<text class="rec-pctl-line__wks-val" x="${xMid}" y="${yWks}" text-anchor="middle">${wToLowestStr}</text>`;
+    html += `</g>`;
+  }
+
+  if (hasRec) {
+    const rx = toX(rec);
+    html += `<g class="rec-pctl-line__rec">`;
+    html += `<title>Rec. Pctl ${rec}%</title>`;
+    html += `<line class="rec-pctl-line__rec-stem" x1="${rx}" y1="4" x2="${rx}" y2="12"/>`;
+    html += `<polygon class="rec-pctl-line__rec-head" points="${rx},${BAR_Y - 1} ${rx - 6},12 ${rx + 6},12"/>`;
+    html += `</g>`;
+  }
+
+  html += `</svg></div>`;
+  return html;
 }
 
 /** Color hint on recommended pricing percentile (Rec. Pctl %) column by target level */
@@ -644,6 +741,40 @@ function deriveFinalPricePercentile(finalPrice, p25, p50, p75, p90) {
     else pct = 90 + ((f - q90) / d) * 15;
   }
   return Math.round(Math.max(0, Math.min(100, pct)));
+}
+
+/**
+ * Nightly $ at percentile `pct` (0–100) on the same P25–P90 ladder as Fin % (inverse of deriveFinalPricePercentile).
+ */
+function derivePriceFromPercentileLadder(pct, p25, p50, p75, p90) {
+  const p = Number(pct);
+  const q25 = Number(p25);
+  const q50 = Number(p50);
+  const q75 = Number(p75);
+  const q90 = Number(p90);
+  if (!Number.isFinite(p) || ![q25, q50, q75, q90].every(Number.isFinite) || q25 <= 0) return null;
+  if (q25 > q50 || q50 > q75 || q75 > q90) return null;
+  const eps = 1e-6;
+  let price;
+  if (p <= 50) {
+    const d = q50 - q25;
+    if (d < eps) price = q25;
+    else price = q25 + ((p - 25) / 25) * d;
+  } else if (p <= 75) {
+    const d = q75 - q50;
+    if (d < eps) price = q50;
+    else price = q50 + ((p - 50) / 25) * d;
+  } else if (p <= 90) {
+    const d = q90 - q75;
+    if (d < eps) price = q75;
+    else price = q75 + ((p - 75) / 15) * d;
+  } else {
+    const d = q90 - q75;
+    if (d < eps) price = q90;
+    else price = q90 + ((p - 90) / 15) * d;
+  }
+  if (!Number.isFinite(price)) return null;
+  return Math.round(Math.max(0, price));
 }
 
 // --- Sample market occupancy by week: current, LY same-date pace (LYT), LY final realized — Fri–Thu weeks. ---
@@ -749,6 +880,27 @@ function diffDaysInclusive(fromDateStr, toDateStr) {
   return Math.round(ms / (24 * 60 * 60 * 1000)) + 1;
 }
 
+/** Calendar YYYY-MM-DD for Future table “As Of”: Hospitable pull date if set, else today (local). */
+function getFuturePacingAsOfYmd() {
+  const iso = localStorage.getItem(STORAGE_KEYS.hospitableAsOf);
+  if (iso) {
+    const d = new Date(iso);
+    if (!isNaN(d.getTime())) return toYMDLocal(d);
+  }
+  const t = new Date();
+  t.setHours(0, 0, 0, 0);
+  return toYMDLocal(t);
+}
+
+/** Fractional weeks from `fromYmd` to `toYmd` (local calendar): period start minus as-of. */
+function weeksFromYmdToYmd(fromYmd, toYmd) {
+  const a = parseYMDToLocalNoon(fromYmd);
+  const b = parseYMDToLocalNoon(toYmd);
+  if (!a || !b) return null;
+  const msPerWeek = 7 * 24 * 60 * 60 * 1000;
+  return (b.getTime() - a.getTime()) / msPerWeek;
+}
+
 function splitPeriodIntoFriThuChunks(periodStart, periodEnd) {
   // Split a consecutive unbooked streak into Fri-Thu sub-periods.
   // - If it starts before Friday, first chunk ends on Thursday and next starts Friday.
@@ -810,8 +962,8 @@ function getRecommendations(
         text: `Week of ${fp.periodStart}: LY final ${fp.finalExpected}% → ~${tier.effectivePacingPercentile ?? tier.targetPricePercentile}th price pctl${
           tier.weeksToStartReducing > 0
             ? tier.weeksAhead > 0 && tier.lowerPercentileTo > tier.lowestPricePercentile
-              ? ` (Target ${tier.targetPricePercentile}% → Lower ${tier.lowerPercentileTo}% @ Wks to Lower ${tier.weeksAhead} → Lowest ${tier.lowestPricePercentile}% / Wks to Lowest ${tier.weeksToStartReducing})`
-              : ` (Target ${tier.targetPricePercentile}% → Lowest ${tier.lowestPricePercentile}% over Wks to Lowest ${tier.weeksToStartReducing})`
+              ? ` (Target ${tier.targetPricePercentile}% → Lower ${tier.lowerPercentileTo}% @ Wks to Lower ${formatWeeksOneDecimal(tier.weeksAhead)} → Lowest ${tier.lowestPricePercentile}% / Wks to Lowest ${formatWeeksOneDecimal(tier.weeksToStartReducing)})`
+              : ` (Target ${tier.targetPricePercentile}% → Lowest ${tier.lowestPricePercentile}% over Wks to Lowest ${formatWeeksOneDecimal(tier.weeksToStartReducing)})`
             : ` (Target ${tier.targetPricePercentile}%)`
         }. ${fp.remainingPotential > 30 ? 'Good remaining demand—consider holding rate.' : 'Limited remaining demand—consider promotions.'}`,
       });
@@ -820,7 +972,7 @@ function getRecommendations(
   if (unbooked.length > 14) {
     recs.push({
       type: 'action',
-      text: `${unbooked.length} unbooked nights in the selected window (${unbookedHorizonDays} days). Use the Future unbooked periods table to set price percentiles by week.`,
+      text: `${unbooked.length} unbooked nights in the selected window (${unbookedHorizonDays} days). Use the Future Unbooked Periods table to set price percentiles by week.`,
     });
   }
   const todayNoon = new Date();
@@ -1556,14 +1708,19 @@ function renderMarketCsvPanel() {
   const extraEl = document.getElementById('marketExtraCols');
   const clearBtn = document.getElementById('clearMarketCsv');
   const dropzone = document.getElementById('marketCsvDropzone');
+  const mapPlaceholder = document.getElementById('marketColumnMapPlaceholder');
   if (!statusEl || !mapWrap || !mapBody) return;
+
+  const statusBase = 'market-csv-status market-csv-status--compact';
 
   const bundle = loadMarketPacingBundle();
   if (!bundle || !bundle.rows.length) {
     statusEl.textContent = '';
-    statusEl.className = 'market-csv-status';
+    statusEl.removeAttribute('title');
+    statusEl.className = statusBase;
     mapWrap.hidden = true;
     mapBody.innerHTML = '';
+    if (mapPlaceholder) mapPlaceholder.hidden = false;
     if (extraEl) {
       extraEl.hidden = true;
       extraEl.textContent = '';
@@ -1574,8 +1731,11 @@ function renderMarketCsvPanel() {
   }
 
   const meta = bundle.meta || {};
-  statusEl.className = 'market-csv-status market-csv-status--ok';
-  statusEl.innerHTML = `Using <strong>${escapeHtml(meta.fileName || 'saved market CSV')}</strong> — ${bundle.rows.length} week row(s). The future unbooked table uses this file instead of sample market data.`;
+  statusEl.className = `${statusBase} market-csv-status--ok`;
+  let shortName = meta.fileName || 'Market CSV';
+  if (shortName.length > 14) shortName = `${shortName.slice(0, 12)}…`;
+  statusEl.textContent = `${shortName} · ${bundle.rows.length} rows`;
+  statusEl.title = `Future unbooked table uses this file instead of sample market data. Full name: ${meta.fileName || 'saved'}`;
 
   const columnMap = Array.isArray(meta.columnMap) ? meta.columnMap : [];
   mapBody.innerHTML = columnMap
@@ -1585,6 +1745,7 @@ function renderMarketCsvPanel() {
     )
     .join('');
   mapWrap.hidden = false;
+  if (mapPlaceholder) mapPlaceholder.hidden = true;
 
   if (extraEl) {
     const extras = meta.extraHeaders;
@@ -1706,6 +1867,7 @@ function saveUserPacingDefaults(rows) {
 function buildFuturePeriodsWithMarket(reservations, pacingTiers, horizonDays) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+  const asOfYmd = getFuturePacingAsOfYmd();
   const { firstYmd, lastYmd } = getUnbookedWindowYMDBounds(today, horizonDays);
   if (!firstYmd || !lastYmd) return [];
 
@@ -1740,9 +1902,10 @@ function buildFuturePeriodsWithMarket(reservations, pacingTiers, horizonDays) {
       finalExpected != null && pacingTiers && pacingTiers.length
         ? resolvePacingTarget(finalExpected, pacingTiers)
         : null;
+    const weeksAwayFromAsOf = weeksFromYmdToYmd(asOfYmd, p.periodStart);
     const effectivePacingPercentile =
-      tierBase && p.periodStart
-        ? computeEffectivePacingPercentile(tierBase, p.periodStart, today)
+      tierBase != null && weeksAwayFromAsOf != null && Number.isFinite(weeksAwayFromAsOf)
+        ? computeRecPctlPercentileFromWksAway(tierBase, weeksAwayFromAsOf, finalExpected)
         : null;
     const tier =
       tierBase != null
@@ -1756,6 +1919,7 @@ function buildFuturePeriodsWithMarket(reservations, pacingTiers, horizonDays) {
     const finalPricePercentile = deriveFinalPricePercentile(finalPrice, priceP25, priceP50, priceP75, priceP90);
     out.push({
       ...p,
+      weeksAwayFromAsOf,
       currentMarketOccupancy: current,
       lastYearTodayOccupancy,
       finalExpectedOccupancy: finalExpected,
@@ -1837,8 +2001,15 @@ function renderFuturePacingCharts(futurePeriodsWithMarket) {
   };
 
   const tooltipLabel = (ctx, key) => {
-    const raw = fps[ctx.dataIndex][key];
     const name = ctx.dataset.label || '';
+    if (key === 'recPacingPercentile') {
+      const fp = fps[ctx.dataIndex];
+      const t = fp?.tier;
+      const raw = t ? t.effectivePacingPercentile ?? t.targetPricePercentile : null;
+      if (raw == null || !Number.isFinite(Number(raw))) return `${name}: —`;
+      return `${name}: ${Math.round(Number(raw))}%`;
+    }
+    const raw = fps[ctx.dataIndex][key];
     if (raw == null || !Number.isFinite(Number(raw))) return `${name}: —`;
     return `${name}: ${Number(raw)}%`;
   };
@@ -1952,6 +2123,55 @@ function renderFuturePacingCharts(futurePeriodsWithMarket) {
             clip: false,
           },
         },
+        {
+          type: 'line',
+          label: 'Rec. Pctl %',
+          yAxisID: 'y1',
+          order: 101,
+          data: fps.map((fp) => {
+            const t = fp.tier;
+            if (!t) return null;
+            const v = t.effectivePacingPercentile ?? t.targetPricePercentile;
+            return v != null && Number.isFinite(Number(v)) ? Number(v) : null;
+          }),
+          _fieldKey: 'recPacingPercentile',
+          borderColor: 'rgba(63, 210, 95, 0.95)',
+          backgroundColor: 'rgba(63, 210, 95, 0.06)',
+          borderWidth: 2.25,
+          tension: 0.22,
+          pointRadius: 3.5,
+          pointHoverRadius: 5.5,
+          pointBackgroundColor: 'rgba(90, 235, 120, 1)',
+          pointBorderColor: 'rgba(20, 24, 30, 1)',
+          pointBorderWidth: 2,
+          spanGaps: false,
+          fill: false,
+          datalabels: {
+            display(ctx) {
+              const fp = fps[ctx.dataIndex];
+              const t = fp?.tier;
+              const v = t ? t.effectivePacingPercentile ?? t.targetPricePercentile : null;
+              return v != null && Number.isFinite(Number(v));
+            },
+            formatter(_, ctx) {
+              const fp = fps[ctx.dataIndex];
+              const t = fp?.tier;
+              const v = t ? t.effectivePacingPercentile ?? t.targetPricePercentile : null;
+              return `${Math.round(Number(v))}%`;
+            },
+            color: 'rgba(140, 255, 170, 1)',
+            backgroundColor: 'rgba(18, 22, 28, 0.94)',
+            borderColor: 'rgba(63, 210, 95, 0.85)',
+            borderWidth: 1,
+            borderRadius: 6,
+            padding: { top: 4, right: 6, bottom: 4, left: 6 },
+            font: { weight: '700', size: 10, family: "'JetBrains Mono', monospace" },
+            anchor: 'center',
+            align: 'bottom',
+            offset: 18,
+            clip: false,
+          },
+        },
       ],
     },
     options: {
@@ -2010,7 +2230,7 @@ function renderFuturePacingCharts(futurePeriodsWithMarket) {
           max: 100,
           title: {
             display: true,
-            text: 'Price',
+            text: 'Fin % / Rec. Pctl %',
             color: 'rgba(229, 192, 123, 0.95)',
             font: { size: 11, weight: '600' },
           },
@@ -2081,19 +2301,66 @@ function formatPctWhole(v) {
   return `${Math.round(Number(v))}%`;
 }
 
+/** Rec−Fin cell style: stronger green/red as |Rec−Fin| grows (mix toward --success / --danger). */
+function formatRecMinusFinDiffStyle(d) {
+  const n = Math.round(Number(d));
+  if (!Number.isFinite(n)) return '';
+  const cap = 30;
+  const t = Math.min(1, Math.abs(n) / cap);
+  const mix = Math.round(12 + t * 88);
+  if (n === 0) return 'color: var(--text-muted); font-weight: 600;';
+  if (n > 0) {
+    return `color: color-mix(in srgb, var(--success) ${mix}%, var(--text-muted)); font-weight: 600;`;
+  }
+  return `color: color-mix(in srgb, var(--danger) ${mix}%, var(--text-muted)); font-weight: 600;`;
+}
+
 function formatMoneyWhole(v) {
   if (v == null || !Number.isFinite(Number(v))) return null;
   return `$${Math.round(Number(v)).toLocaleString()}`;
 }
 
-/** Compact period for dense table: MM-DD or MM-DD→MM-DD within a year. */
-function formatFuturePacingPeriodCompact(periodStart, periodEnd) {
-  if (!periodStart || !periodEnd) return '—';
-  if (periodStart === periodEnd) return periodStart.slice(5);
-  const y1 = periodStart.slice(0, 4);
-  const y2 = periodEnd.slice(0, 4);
-  if (y1 === y2) return `${periodStart.slice(5)}→${periodEnd.slice(5)}`;
-  return `${periodStart.slice(5)}→${periodEnd}`;
+const FUTURE_PACING_MONTH_SHORT = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+function parseFuturePacingYmdParts(ymd) {
+  if (!ymd || typeof ymd !== 'string' || ymd.length < 10) return null;
+  const y = Number(ymd.slice(0, 4));
+  const m = Number(ymd.slice(5, 7));
+  const d = Number(ymd.slice(8, 10));
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  return { y, m, d };
+}
+
+/** Table: abbreviated month(s), e.g. Mar or Mar–Apr when the range spans months. */
+function formatFuturePacingMonthAbbrevRange(periodStart, periodEnd) {
+  const a = parseFuturePacingYmdParts(periodStart);
+  const b = parseFuturePacingYmdParts(periodEnd);
+  if (!a || !b) return '—';
+  if (a.y === b.y && a.m === b.m) return FUTURE_PACING_MONTH_SHORT[a.m - 1];
+  return `${FUTURE_PACING_MONTH_SHORT[a.m - 1]}–${FUTURE_PACING_MONTH_SHORT[b.m - 1]}`;
+}
+
+/** Table: day-of-month only, e.g. 12 or 12→15. */
+function formatFuturePacingPeriodDaysOnly(periodStart, periodEnd) {
+  const a = parseFuturePacingYmdParts(periodStart);
+  const b = parseFuturePacingYmdParts(periodEnd);
+  if (!a || !b) return '—';
+  if (periodStart === periodEnd) return String(a.d);
+  return `${a.d}→${b.d}`;
 }
 
 function normalizeUnbookedHorizonDays(raw) {
@@ -2125,25 +2392,87 @@ function updateUnbookedSectionHeading() {
 // --- UI ---
 function loadStored() {
   const target = localStorage.getItem(STORAGE_KEYS.revenueTarget);
-  const period = localStorage.getItem(STORAGE_KEYS.period) || 'month';
   const raw = localStorage.getItem(STORAGE_KEYS.reservations);
   return {
     revenueTarget: target ? parseFloat(target) : null,
-    period,
     reservations: raw ? parseReservations(raw) : null,
     pacingTiers: loadPacingTiers(),
   };
 }
 
-function saveStored(revenueTarget, period, reservations) {
+function saveStored(revenueTarget, reservations) {
   if (revenueTarget != null) localStorage.setItem(STORAGE_KEYS.revenueTarget, String(revenueTarget));
-  if (period) localStorage.setItem(STORAGE_KEYS.period, period);
   if (reservations && reservations.length)
     localStorage.setItem(STORAGE_KEYS.reservations, JSON.stringify(reservations));
 }
 
+/** Record that booking data was just loaded from Hospitable (local device time). */
+function setHospitableAsOfToNow() {
+  localStorage.setItem(STORAGE_KEYS.hospitableAsOf, new Date().toISOString());
+  refreshHospitableAsOfBanner();
+}
+
+/** Booking data is no longer from Hospitable (sample / CSV / etc.). */
+function clearHospitableAsOf() {
+  localStorage.removeItem(STORAGE_KEYS.hospitableAsOf);
+  refreshHospitableAsOfBanner();
+}
+
+function refreshHospitableAsOfBanner() {
+  const wrap = document.getElementById('hospitableAsOfBanner');
+  const timeEl = document.getElementById('hospitableAsOfTime');
+  if (!wrap || !timeEl) return;
+  const iso = localStorage.getItem(STORAGE_KEYS.hospitableAsOf);
+  if (!iso) {
+    wrap.hidden = true;
+    timeEl.removeAttribute('datetime');
+    timeEl.textContent = '';
+    return;
+  }
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) {
+    wrap.hidden = true;
+    return;
+  }
+  timeEl.dateTime = iso;
+  timeEl.textContent = d.toLocaleString(undefined, {
+    dateStyle: 'long',
+    timeStyle: 'short',
+  });
+  wrap.hidden = false;
+}
+
+function syncFuturePacingTableDetailsUI() {
+  const table = document.getElementById('futurePacingTable');
+  const btn = document.getElementById('futurePacingDetailsToggle');
+  if (!table || !btn) return;
+  const visible = table.classList.contains('future-pacing-table--details-visible');
+  btn.setAttribute('aria-pressed', visible ? 'true' : 'false');
+  btn.textContent = visible ? 'Hide Details' : 'Show Details';
+}
+
+function syncFuturePacingTableToolbarVisibility() {
+  const table = document.getElementById('futurePacingTable');
+  const toolbar = document.getElementById('futurePacingTableToolbar');
+  if (!toolbar || !table) return;
+  toolbar.hidden = table.hidden;
+}
+
+/** Apply saved “Show details” state to the future pacing table. */
+function applyFuturePacingTableDetailsFromStorage() {
+  const table = document.getElementById('futurePacingTable');
+  if (!table) return;
+  if (localStorage.getItem(STORAGE_KEYS.futurePacingTableDetailsVisible) === '1') {
+    table.classList.add('future-pacing-table--details-visible');
+  } else {
+    table.classList.remove('future-pacing-table--details-visible');
+  }
+  syncFuturePacingTableDetailsUI();
+}
+
 function render(reservations, periodKey, revenueTarget) {
   updateUnbookedSectionHeading();
+  applyFuturePacingTableDetailsFromStorage();
   const horizonDays = getUnbookedHorizonDays();
   const pacingTiers = loadPacingTiers();
   if (!reservations || !reservations.length) {
@@ -2169,6 +2498,7 @@ function render(reservations, periodKey, revenueTarget) {
     if (chartsWrap) chartsWrap.hidden = true;
     if (emptyHint) emptyHint.hidden = false;
     if (tableEl) tableEl.hidden = true;
+    syncFuturePacingTableToolbarVisibility();
     renderMarketCsvPanel();
     return;
   }
@@ -2236,6 +2566,7 @@ function render(reservations, periodKey, revenueTarget) {
     if (emptyHint) emptyHint.hidden = true;
     if (tableEl) tableEl.hidden = false;
     if (tbody) {
+      const futureTableAsOfYmd = getFuturePacingAsOfYmd();
       tbody.innerHTML = futurePeriodsWithMarket
         .map((fp) => {
           const currentStr = formatPctWhole(fp.currentMarketOccupancy) ?? '—';
@@ -2243,6 +2574,10 @@ function render(reservations, periodKey, revenueTarget) {
           const finalStr = formatPctWhole(fp.finalExpectedOccupancy) ?? '—';
           const remainingStr = formatPctWhole(fp.remainingPotential) ?? '—';
           const remainingLyStr = formatPctWhole(fp.remainingPotentialLY) ?? '—';
+          const wksAwayStr =
+            fp.weeksAwayFromAsOf != null && Number.isFinite(fp.weeksAwayFromAsOf)
+              ? (Math.round(fp.weeksAwayFromAsOf * 10) / 10).toFixed(1)
+              : '—';
           const finStr = formatMoneyWhole(fp.finalPrice) ?? '—';
           const finPctStr = formatPctWhole(fp.finalPricePercentile) ?? '—';
           const p25Str = formatMoneyWhole(fp.priceP25) ?? '—';
@@ -2253,34 +2588,79 @@ function render(reservations, periodKey, revenueTarget) {
           const eff = tier ? tier.effectivePacingPercentile ?? tier.targetPricePercentile : null;
           const pctStr = tier && eff != null ? `${eff}%` : '—';
           const tierTitleAttr = tier
-            ? ` title="${buildRecPctlCellTitle(tier, eff)}"`
+            ? ` title="${buildRecPctlCellTitle(tier, eff, {
+                wksAway: fp.weeksAwayFromAsOf,
+                lyFinPct: fp.finalExpectedOccupancy,
+              })}"`
             : '';
           const heat = tier && eff != null ? pacingPercentileHeatClass(eff) : '';
           const tierClass = tier ? `pct-cell ${heat}` : 'pct-cell';
+          const recResolved =
+            tier &&
+            tier.effectivePacingPercentile != null &&
+            Number.isFinite(Number(tier.effectivePacingPercentile))
+              ? tier.effectivePacingPercentile
+              : null;
+          const recLineHtml = buildRecPctlNumberLineHtml(tier, recResolved);
+          const recPriceVal =
+            recResolved != null
+              ? derivePriceFromPercentileLadder(recResolved, fp.priceP25, fp.priceP50, fp.priceP75, fp.priceP90)
+              : null;
+          const recDollarStr = formatMoneyWhole(recPriceVal) ?? '—';
+          const recDollarTitle =
+            recResolved != null
+              ? escapeHtmlAttr(
+                  recPriceVal != null
+                    ? `Rec. Pctl % ${recResolved}%; same P25–P90 ladder as Fin %`
+                    : `Rec. Pctl % ${recResolved}%; P25–P90 ladder unavailable for this period`
+                )
+              : '';
+          const recDollarTitleAttr = recDollarTitle ? ` title="${recDollarTitle}"` : '';
+          const finPctNum =
+            fp.finalPricePercentile != null && Number.isFinite(Number(fp.finalPricePercentile))
+              ? Number(fp.finalPricePercentile)
+              : null;
+          let recMinusFinStr = '—';
+          let recMinusFinTitleAttr = '';
+          let recMinusFinStyleAttr = '';
+          if (tier != null && eff != null && finPctNum != null) {
+            const d = Math.round(Number(eff) - finPctNum);
+            recMinusFinStr = `${d > 0 ? '+' : ''}${d}%`;
+            recMinusFinTitleAttr = ` title="${escapeHtmlAttr(`Rec. Pctl % (${eff}) − Fin % (${finPctNum})`)}"`;
+            const diffCss = formatRecMinusFinDiffStyle(d);
+            if (diffCss) recMinusFinStyleAttr = ` style="${escapeHtmlAttr(diffCss)}"`;
+          }
           const dowRange = formatDowRange(fp.periodStart, fp.periodEnd);
-          const periodCompact = formatFuturePacingPeriodCompact(fp.periodStart, fp.periodEnd);
+          const monthAbbrev = formatFuturePacingMonthAbbrevRange(fp.periodStart, fp.periodEnd);
+          const periodDays = formatFuturePacingPeriodDaysOnly(fp.periodStart, fp.periodEnd);
           const periodTitle = `${fp.periodStart} – ${fp.periodEnd}`;
           return `<tr>
-            <td class="future-pacing-period-cell" title="${periodTitle}">${periodCompact}</td>
+            <td class="future-pacing-month-cell" title="${periodTitle}">${monthAbbrev}</td>
+            <td class="future-pacing-period-cell" title="${periodTitle}">${periodDays}</td>
             <td class="future-pacing-dow-cell" title="${dowRange}">${dowRange}</td>
             <td class="future-pacing-num-cell">${fp.unbookedNights}</td>
-            <td class="pct-cell">${currentStr}</td>
-            <td class="pct-cell">${lytStr}</td>
-            <td class="pct-cell">${finalStr}</td>
+            <td class="pct-cell future-pacing-detail-col">${currentStr}</td>
+            <td class="pct-cell future-pacing-detail-col">${lytStr}</td>
             <td class="pct-cell">${remainingStr}</td>
-            <td class="pct-cell">${remainingLyStr}</td>
+            <td class="pct-cell future-pacing-detail-col">${remainingLyStr}</td>
+            <td class="pct-cell">${finalStr}</td>
+            <td class="future-pacing-num-cell" title="As Of ${futureTableAsOfYmd} → period start ${fp.periodStart}">${wksAwayStr}</td>
             <td class="money-cell">${finStr}</td>
             <td class="pct-cell">${finPctStr}</td>
-            <td class="money-cell">${p25Str}</td>
-            <td class="money-cell">${p50Str}</td>
-            <td class="money-cell">${p75Str}</td>
-            <td class="money-cell">${p90Str}</td>
+            <td class="pct-cell future-pacing-rec-minus-fin"${recMinusFinTitleAttr}${recMinusFinStyleAttr}>${recMinusFinStr}</td>
+            <td class="money-cell ${heat}"${recDollarTitleAttr}>${recDollarStr}</td>
             <td class="${tierClass}"${tierTitleAttr}>${pctStr}</td>
+            <td class="future-pacing-rec-line-cell">${recLineHtml}</td>
+            <td class="money-cell future-pacing-detail-col">${p25Str}</td>
+            <td class="money-cell future-pacing-detail-col">${p50Str}</td>
+            <td class="money-cell future-pacing-detail-col">${p75Str}</td>
+            <td class="money-cell future-pacing-detail-col">${p90Str}</td>
           </tr>`;
         })
         .join('');
     }
   }
+  syncFuturePacingTableToolbarVisibility();
   renderFuturePacingCharts(futurePeriodsWithMarket);
   renderMarketCsvPanel();
 }
@@ -2288,9 +2668,6 @@ function render(reservations, periodKey, revenueTarget) {
 function init() {
   const stored = loadStored();
   let reservations = stored.reservations;
-
-  const periodSelect = document.getElementById('period');
-  periodSelect.value = stored.period || 'month';
 
   const targetInput = document.getElementById('revenueTarget');
   if (stored.revenueTarget != null) targetInput.value = stored.revenueTarget;
@@ -2305,10 +2682,23 @@ function init() {
       localStorage.setItem(STORAGE_KEYS.unbookedHorizonDays, String(d));
       unbookedSelect.value = String(d);
       updateUnbookedSectionHeading();
-      render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+      render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
     });
   }
   updateUnbookedSectionHeading();
+  refreshHospitableAsOfBanner();
+
+  document.getElementById('futurePacingDetailsToggle')?.addEventListener('click', () => {
+    const table = document.getElementById('futurePacingTable');
+    if (!table || table.hidden) return;
+    table.classList.toggle('future-pacing-table--details-visible');
+    if (table.classList.contains('future-pacing-table--details-visible')) {
+      localStorage.setItem(STORAGE_KEYS.futurePacingTableDetailsVisible, '1');
+    } else {
+      localStorage.removeItem(STORAGE_KEYS.futurePacingTableDetailsVisible);
+    }
+    syncFuturePacingTableDetailsUI();
+  });
 
   const marketCsvInput = document.getElementById('marketCsvInput');
   const marketDropzone = document.getElementById('marketCsvDropzone');
@@ -2316,8 +2706,9 @@ function init() {
 
   const showMarketDropError = (msg) => {
     if (!marketCsvStatus) return;
-    marketCsvStatus.className = 'market-csv-status market-csv-status--err';
+    marketCsvStatus.className = 'market-csv-status market-csv-status--compact market-csv-status--err';
     marketCsvStatus.textContent = msg;
+    marketCsvStatus.title = msg;
   };
 
   const applyTopZoneTableRows = (tableRows, fileName) => {
@@ -2357,7 +2748,7 @@ function init() {
         detectedHeaders: headersOriginal,
         loadedAt: new Date().toISOString(),
       });
-      render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+      render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
       return;
     }
 
@@ -2368,8 +2759,9 @@ function init() {
         return;
       }
       reservations = parsed;
-      saveStored(parseFloat(targetInput.value) || null, periodSelect.value, reservations);
-      render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+      clearHospitableAsOf();
+      saveStored(parseFloat(targetInput.value) || null, reservations);
+      render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
       return;
     }
 
@@ -2403,6 +2795,25 @@ function init() {
       reader.readAsText(file);
     }
   };
+
+  const marketColumnMapDialog = document.getElementById('marketColumnMapDialog');
+  const openMarketColumnMapBtn = document.getElementById('openMarketColumnMap');
+  const closeMarketColumnMapBtn = document.getElementById('closeMarketColumnMap');
+  if (openMarketColumnMapBtn && marketColumnMapDialog) {
+    openMarketColumnMapBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      marketColumnMapDialog.showModal();
+    });
+  }
+  if (closeMarketColumnMapBtn && marketColumnMapDialog) {
+    closeMarketColumnMapBtn.addEventListener('click', () => marketColumnMapDialog.close());
+  }
+  if (marketColumnMapDialog) {
+    marketColumnMapDialog.addEventListener('click', (e) => {
+      if (e.target === marketColumnMapDialog) marketColumnMapDialog.close();
+    });
+  }
 
   if (marketDropzone && marketCsvInput) {
     marketDropzone.addEventListener('click', () => marketCsvInput.click());
@@ -2439,7 +2850,7 @@ function init() {
   if (clearMarketCsvBtn) {
     clearMarketCsvBtn.addEventListener('click', () => {
       clearMarketPacingBundle();
-      render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+      render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
     });
   }
 
@@ -2447,24 +2858,15 @@ function init() {
     const v = parseFloat(targetInput.value);
     if (!isNaN(v) && v >= 0) {
       localStorage.setItem(STORAGE_KEYS.revenueTarget, String(v));
-      render(reservations, periodSelect.value, v);
+      render(reservations, PACING_PERIOD_KEY, v);
     }
-  });
-
-  periodSelect.addEventListener('change', () => {
-    const p = periodSelect.value;
-    localStorage.setItem(STORAGE_KEYS.period, p);
-    render(reservations, p, parseFloat(targetInput.value) || null);
   });
 
   document.getElementById('useSample').addEventListener('click', () => {
     reservations = getSampleReservations();
-    saveStored(
-      parseFloat(targetInput.value) || null,
-      periodSelect.value,
-      reservations
-    );
-    render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+    clearHospitableAsOf();
+    saveStored(parseFloat(targetInput.value) || null, reservations);
+    render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
   });
 
   const fetchHospitableBtn = document.getElementById('fetchHospitable');
@@ -2517,12 +2919,9 @@ function init() {
           checkOut: r.checkOut,
           revenue: Number(r.revenue) || 0,
         }));
-        saveStored(
-          parseFloat(targetInput.value) || null,
-          periodSelect.value,
-          reservations
-        );
-        render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+        setHospitableAsOfToNow();
+        saveStored(parseFloat(targetInput.value) || null, reservations);
+        render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
       } catch (err) {
         alert('Fetch from Hospitable failed. Is the backend running (npm start)? ' + (err.message || String(err)));
       } finally {
@@ -2531,46 +2930,6 @@ function init() {
       }
     });
   }
-
-  document.getElementById('csvInput').addEventListener('change', (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (isSpreadsheetFile(file)) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const out = parseWorkbookArrayBufferToRows(reader.result);
-        if (out.error) {
-          alert(out.error);
-          return;
-        }
-        reservations = parseReservationsFromTableRows(out.rows);
-        if (!reservations.length) {
-          alert('No valid reservation rows (need check_in and check_out columns in the first sheet).');
-          return;
-        }
-        saveStored(
-          parseFloat(targetInput.value) || null,
-          periodSelect.value,
-          reservations
-        );
-        render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
-      };
-      reader.readAsArrayBuffer(file);
-    } else {
-      const reader = new FileReader();
-      reader.onload = () => {
-        reservations = parseCSV(reader.result);
-        saveStored(
-          parseFloat(targetInput.value) || null,
-          periodSelect.value,
-          reservations
-        );
-        render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
-      };
-      reader.readAsText(file);
-    }
-    e.target.value = '';
-  });
 
   document.getElementById('openSettings').addEventListener('click', () => {
     openPacingSettingsModal();
@@ -2581,13 +2940,13 @@ function init() {
   document.getElementById('savePacingSettings').addEventListener('click', () => {
     savePacingSettingsFromForm();
     document.getElementById('settingsOverlay').hidden = true;
-    render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+    render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
   });
   document.getElementById('resetPacingSettings').addEventListener('click', () => {
     const defs = JSON.parse(JSON.stringify(loadUserPacingDefaults()));
     savePacingTiers(defs);
     populateTiersTable(defs);
-    render(reservations, periodSelect.value, parseFloat(targetInput.value) || null);
+    render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
   });
 
   document.getElementById('savePacingDefaults')?.addEventListener('click', () => {
@@ -2624,15 +2983,71 @@ function init() {
     if (!tr || !tbody || tbody.querySelectorAll('tr').length <= 1) return;
     tr.remove();
   });
+  initPacingTierRowDragDrop();
   document.getElementById('settingsOverlay').addEventListener('click', (e) => {
     if (e.target.id === 'settingsOverlay') e.target.hidden = true;
   });
 
   render(
     reservations,
-    periodSelect.value,
+    PACING_PERIOD_KEY,
     stored.revenueTarget != null ? stored.revenueTarget : parseFloat(targetInput.value) || null
   );
+}
+
+/**
+ * Insert-before target for pacing row drag (y = pointer clientY). Excludes the row being dragged.
+ */
+function getTierDragAfterElement(tbody, dragRow, y) {
+  const els = [...tbody.querySelectorAll('tr')].filter((tr) => tr !== dragRow);
+  return els.reduce(
+    (closest, child) => {
+      const box = child.getBoundingClientRect();
+      const offset = y - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) {
+        return { offset, element: child };
+      }
+      return closest;
+    },
+    { offset: Number.NEGATIVE_INFINITY, element: null }
+  ).element;
+}
+
+/** HTML5 drag reorder for pacing settings rows (grip handle only). */
+function initPacingTierRowDragDrop() {
+  const tbody = document.getElementById('tiersTableBody');
+  if (!tbody || tbody.dataset.tierDragInit) return;
+  tbody.dataset.tierDragInit = '1';
+  let dragRow = null;
+
+  tbody.addEventListener('dragstart', (e) => {
+    const handle = e.target.closest('.tier-drag-handle');
+    if (!handle) return;
+    dragRow = handle.closest('tr');
+    if (!dragRow) return;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', dragRow.dataset.rowId || 'row');
+    dragRow.classList.add('tier-row--dragging');
+  });
+
+  tbody.addEventListener('dragend', () => {
+    if (dragRow) dragRow.classList.remove('tier-row--dragging');
+    dragRow = null;
+  });
+
+  tbody.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (!dragRow) return;
+    const after = getTierDragAfterElement(tbody, dragRow, e.clientY);
+    if (after == null) {
+      if (dragRow.nextSibling !== null) tbody.appendChild(dragRow);
+    } else if (dragRow.nextSibling !== after) {
+      tbody.insertBefore(dragRow, after);
+    }
+  });
+
+  tbody.addEventListener('drop', (e) => e.preventDefault());
 }
 
 function openPacingSettingsModal() {
@@ -2657,6 +3072,14 @@ function pacingRowHtml(r) {
   const wa = coalesceStoredWeeksAhead(r, fin.weeksAhead);
   return `
     <tr data-row-id="${id}">
+      <td class="tiers-drag-cell">
+        <span
+          class="tier-drag-handle"
+          draggable="true"
+          title="Drag to reorder"
+          aria-label="Drag to reorder row"
+        >⋮⋮</span>
+      </td>
       <td>
         <input type="number" min="0" max="100" step="1" value="${fo}" data-field="finalOccupancyPct" title="LY final at or above this % → use this row" />
       </td>
@@ -2667,13 +3090,13 @@ function pacingRowHtml(r) {
         <input type="number" min="0" max="100" step="1" value="${lp}" data-field="lowerPercentileTo" title="Lower Pctl % — between Target and Lowest (two-step ramp)" />
       </td>
       <td>
-        <input class="tiers-input-wide" type="number" min="0" max="104" step="1" value="${wa}" data-field="weeksAhead" title="Wks to Lower — weeks before stay when ramp hits Lower Pctl; 0 = one-step to Lowest" />
+        <input class="tiers-input-wide" type="number" min="0" max="104" step="0.1" value="${formatWeeksOneDecimal(wa)}" data-field="weeksAhead" title="Wks to Lower — weeks before stay when ramp hits Lower Pctl; 0 = one-step to Lowest" />
       </td>
       <td>
         <input type="number" min="0" max="100" step="1" value="${low}" data-field="lowestPricePercentile" title="Lowest Pctl% at first night of stay" />
       </td>
       <td>
-        <input class="tiers-input-wide" type="number" min="0" max="104" step="1" value="${wks}" data-field="weeksToStartReducing" title="Wks to Lowest — start ramp from Target; 0 = always Target" />
+        <input class="tiers-input-wide" type="number" min="0" max="104" step="0.1" value="${formatWeeksOneDecimal(wks)}" data-field="weeksToStartReducing" title="Wks to Lowest — start ramp from Target; 0 = always Target" />
       </td>
       <td>
         <button type="button" class="btn-row-delete btn-small" aria-label="Delete row">&times;</button>
@@ -2693,8 +3116,7 @@ function appendPacingRowToTable(row) {
 function populateTiersTable(rows) {
   const tbody = document.getElementById('tiersTableBody');
   if (!tbody) return;
-  const sorted = [...rows].sort((a, b) => Number(b.finalOccupancyPct) - Number(a.finalOccupancyPct));
-  tbody.innerHTML = sorted.map((r) => pacingRowHtml(r)).join('');
+  tbody.innerHTML = (rows || []).map((r) => pacingRowHtml(r)).join('');
 }
 
 /** Read pacing rows from the modal table (empty → []). */

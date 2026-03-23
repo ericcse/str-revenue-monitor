@@ -28,61 +28,74 @@
           </select>
         </div>
         <button type="button" id="openSettings" class="btn-secondary" title="Edit pacing tier rules">Pacing settings</button>
-        <label class="upload-btn" title="Upload calendar or revenue CSV / Excel (first sheet)">
-          <input type="file" id="csvInput" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
-          Upload CSV
-        </label>
         <button type="button" id="useSample" class="btn-secondary">Sample data</button>
-        <button type="button" id="fetchHospitable" class="btn-secondary" title="Fetch reservations from Hospitable (local server)">Fetch Hospitable</button>
-        <div class="period-select">
-          <label for="period">Period</label>
-          <select id="period">
-            <option value="month">This month</option>
-            <option value="quarter">This quarter</option>
-            <option value="year">This year</option>
-          </select>
+        <div class="header-market-upload">
+          <div
+            id="marketCsvDropzone"
+            class="csv-dropzone csv-dropzone--compact"
+            tabindex="0"
+            role="button"
+            aria-label="Drop or click to upload booking or market CSV or Excel"
+          >
+            <button
+              type="button"
+              id="openMarketColumnMap"
+              class="market-map-info-btn"
+              aria-label="Column mapping and file format"
+              title="Column mapping &amp; file format"
+            >
+              <span class="market-map-info-icon" aria-hidden="true">i</span>
+            </button>
+            <div class="csv-dropzone-compact-body">
+              <span class="csv-dropzone-compact-title">Market</span>
+              <span class="csv-dropzone-compact-hint">Drop · click</span>
+            </div>
+            <p class="market-csv-status market-csv-status--compact" id="marketCsvStatus" role="status"></p>
+            <input
+              type="file"
+              id="marketCsvInput"
+              accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              hidden
+            />
+          </div>
         </div>
+        <button type="button" id="fetchHospitable" class="btn-secondary" title="Fetch reservations from Hospitable (local server)">Fetch Hospitable</button>
       </div>
     </header>
 
-    <section class="market-csv-panel" aria-label="CSV upload">
-      <div
-        id="marketCsvDropzone"
-        class="csv-dropzone"
-        tabindex="0"
-        role="button"
-        aria-label="Drop a CSV file here or press Enter to browse"
-      >
-        <div class="csv-dropzone-inner">
-          <strong>Drag &amp; drop CSV or Excel</strong>
-          <span class="csv-dropzone-hint">Market pacing (week + occupancy columns) or booking export (check-in / check-out) · first sheet only for .xls / .xlsx</span>
-          <p class="csv-dropzone-detail">
-            <strong>Market file:</strong> a week column such as <code>Date</code>, <code>week_start</code>, <code>period_start</code>, or <code>week_of</code>,
-            plus any of <code>market_occ</code>, <code>lyt</code>, <code>market_occ_ly_final</code>, <code>remaining_potential</code>,
-            and optional price columns — e.g. <code>Final Price</code>, <code>Market 25th Percentile Price</code> … <code>Market 90th Percentile Price</code> (any similar <code>final_price</code> / <code>price_p25</code>… names work).
-            Other columns are stored on each row. <strong>Booking file:</strong> same as header &ldquo;Upload CSV&rdquo; (<code>check_in</code>, <code>check_out</code>, revenue).
-            After you load a file, the <em>Column mapping</em> table lists which header we used for each field.
-          </p>
+    <dialog id="marketColumnMapDialog" class="market-column-map-dialog" aria-labelledby="marketColumnMapDialogTitle">
+      <div class="market-column-map-dialog-inner">
+        <div class="market-column-map-dialog-head">
+          <h3 id="marketColumnMapDialogTitle" class="market-column-map-dialog-title">Market CSV</h3>
+          <button type="button" class="market-column-map-dialog-close" id="closeMarketColumnMap" aria-label="Close">×</button>
         </div>
-        <input type="file" id="marketCsvInput" accept=".csv,.xls,.xlsx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
+        <p class="csv-dropzone-detail market-column-map-dialog-help">
+          <strong>Market file:</strong> a week column such as <code>Date</code>, <code>week_start</code>, <code>period_start</code>, or <code>week_of</code>,
+          plus any of <code>market_occ</code>, <code>lyt</code>, <code>market_occ_ly_final</code>, <code>remaining_potential</code>,
+          and optional price columns — e.g. <code>Final Price</code>, <code>Market 25th Percentile Price</code> … <code>Market 90th Percentile Price</code>
+          (any similar <code>final_price</code> / <code>price_p25</code>… names work). Other columns are stored on each row.
+          <strong>Booking file:</strong> use the <strong>Upload</strong> drop zone in the header (<code>check_in</code>, <code>check_out</code>, revenue).
+        </p>
+        <p class="market-column-map-placeholder" id="marketColumnMapPlaceholder">No market file loaded yet. Use the <strong>Market</strong> box in the header.</p>
+        <div class="market-column-map" id="marketColumnMap" hidden>
+          <h4 class="market-column-map-title">Column mapping</h4>
+          <p class="market-column-map-sub">How your CSV headers map to the dashboard (edit the file to match if a row shows —).</p>
+          <table class="market-column-map-table">
+            <thead>
+              <tr>
+                <th>Field</th>
+                <th>Your column</th>
+              </tr>
+            </thead>
+            <tbody id="marketColumnMapBody"></tbody>
+          </table>
+          <p class="market-extra-cols" id="marketExtraCols" hidden></p>
+        </div>
+        <div class="market-column-map-dialog-actions">
+          <button type="button" id="clearMarketCsv" class="btn-secondary btn-small market-clear-btn" hidden>Clear market CSV</button>
+        </div>
       </div>
-      <p class="market-csv-status" id="marketCsvStatus" role="status"></p>
-      <div class="market-column-map" id="marketColumnMap" hidden>
-        <h3 class="market-column-map-title">Column mapping</h3>
-        <p class="market-column-map-sub">How your CSV headers map to the dashboard (edit the file to match if a row shows —).</p>
-        <table class="market-column-map-table">
-          <thead>
-            <tr>
-              <th>Field</th>
-              <th>Your column</th>
-            </tr>
-          </thead>
-          <tbody id="marketColumnMapBody"></tbody>
-        </table>
-        <p class="market-extra-cols" id="marketExtraCols" hidden></p>
-      </div>
-      <button type="button" id="clearMarketCsv" class="btn-secondary btn-small market-clear-btn" hidden>Clear market CSV</button>
-    </section>
+    </dialog>
 
     <main class="main">
       <div class="top-metrics-row">
@@ -148,9 +161,25 @@
       </section>
       </div>
 
-      <!-- Future unbooked periods: market pacing & pricing -->
+      <!-- Future Unbooked Periods — Market Pacing -->
       <section class="card card-future-pacing">
-        <h2>Future unbooked periods — market pacing</h2>
+        <div class="future-pacing-heading">
+          <h2>Future Unbooked Periods — Market Pacing</h2>
+          <span
+            class="hospitable-as-of-banner"
+            id="hospitableAsOfBanner"
+            hidden
+            role="status"
+            aria-label="Hospitable booking data as of date"
+          >
+            <span class="hospitable-as-of-banner__sep" aria-hidden="true">·</span>
+            <span class="hospitable-as-of-banner__label">As Of Date</span>
+            <span class="hospitable-as-of-banner__sep" aria-hidden="true">·</span>
+            <time class="hospitable-as-of-banner__time" id="hospitableAsOfTime"></time>
+            <span class="hospitable-as-of-banner__sep" aria-hidden="true">·</span>
+            <span class="hospitable-as-of-banner__hint">Hospitable booking pull</span>
+          </span>
+        </div>
         <p class="card-desc">Market occupancy (current), last-year pace on the same calendar date (LYT), and last year’s realized market occupancy (LY final). Remaining potential vs current (LY final − current), remaining potential vs LY pace (LY final − LYT), and suggested price percentile.</p>
         <div id="futurePacingCharts" class="future-pacing-charts" hidden>
           <div class="future-pacing-chart-block">
@@ -158,7 +187,7 @@
               <div class="future-pacing-chart-canvas-wrap" id="futurePacingChartCanvasWrap">
                 <canvas
                   id="futurePacingChartCombined"
-                  aria-label="Current vs last year: market occupancy and remaining potential by period"
+                  aria-label="Current vs last year: market occupancy and remaining potential by period; Fin % and Rec. Pctl % on the right axis"
                 ></canvas>
               </div>
             </div>
@@ -166,24 +195,39 @@
         </div>
         <div id="futurePacingTableWrap" class="future-pacing-wrap">
           <p class="empty-hint" id="futurePacingEmpty">Load data to see future periods and market pacing.</p>
+          <div class="future-pacing-table-toolbar" id="futurePacingTableToolbar" hidden>
+            <button
+              type="button"
+              class="btn-secondary btn-small"
+              id="futurePacingDetailsToggle"
+              aria-pressed="false"
+            >
+              Show Details
+            </button>
+          </div>
           <table class="future-pacing-table" id="futurePacingTable" hidden>
             <thead>
               <tr>
-                <th title="Stay period (check unbooked range)">Period</th>
+                <th title="Calendar month of the period (range if it spans months)">Month</th>
+                <th title="Calendar days in the period (full dates on hover)">Period</th>
                 <th title="Days of week">DOW</th>
                 <th title="Unbooked nights">Nts</th>
-                <th title="Market occupancy (current)">Cur</th>
-                <th title="Market occupancy last year today (pace)">LYT</th>
-                <th title="Market occupancy LY final (realized)">LY fin</th>
+                <th class="future-pacing-detail-col" title="Market occupancy (current)">Cur</th>
+                <th class="future-pacing-detail-col" title="Market occupancy last year today (pace)">LYT</th>
                 <th title="Remaining potential vs current (LY final − current, or file)">Rem</th>
-                <th title="Remaining potential vs LY pace (LY final − LYT)">Rm LY</th>
+                <th class="future-pacing-detail-col" title="Remaining potential vs LY pace (LY final − LYT)">Rm LY</th>
+                <th title="Market occupancy LY final (realized)">LY Fin</th>
+                <th title="Weeks from As Of Date (Hospitable pull when shown in the heading, otherwise today) to the first calendar day of the period">Wks Away</th>
                 <th title="Final / recommended nightly price">Fin $</th>
                 <th title="Implied percentile of Final $ vs P25–P90 (piecewise linear)">Fin %</th>
-                <th title="25th percentile market price">P25</th>
-                <th title="50th percentile (median) market price">P50</th>
-                <th title="75th percentile market price">P75</th>
-                <th title="90th percentile market price">P90</th>
-                <th title="Recommended Pricing Percentile % — from LY final occupancy: linear blend of pacing rows by Final Occ. %, then time ramp to stay. Hover a cell for Target / Lower / Wks to Lower / Lowest / Wks to Lowest.">Rec. Pctl %</th>
+                <th title="Rec. Pctl % minus Fin % (percentage points)">Rec−Fin</th>
+                <th title="Nightly rate implied by Rec. Pctl % on the same P25–P90 piecewise-linear ladder as Fin %">Rec. $</th>
+                <th title="Recommended price percentile from pacing row (LY Fin vs settings) and Wks Away vs Wks to Lower / Wks to Lowest. Hover a cell for inputs and the full formula.">Rec. Pctl %</th>
+                <th title="Number line: T = Target, L = Lower, F = Lowest. Higher percentile on the left, lower on the right. Arrow = Rec. Pctl %.">Rec. scale</th>
+                <th class="future-pacing-detail-col" title="25th percentile market price">P25</th>
+                <th class="future-pacing-detail-col" title="50th percentile (median) market price">P50</th>
+                <th class="future-pacing-detail-col" title="75th percentile market price">P75</th>
+                <th class="future-pacing-detail-col" title="90th percentile market price">P90</th>
               </tr>
             </thead>
             <tbody id="futurePacingBody"></tbody>
@@ -220,11 +264,13 @@
             Each row is a <strong>threshold</strong>: when <strong>LY final</strong> is <strong>at or above</strong> <strong>Final Occ. %</strong>, that row applies.
             From <strong>Wks to Lowest</strong> weeks before the stay: ramp <strong>Target → Lower Pctl %</strong> by <strong>Wks to Lower</strong> weeks out, then <strong>Lower → Lowest Pctl%</strong> by the first night.
             Set <strong>Wks to Lower</strong> to <strong>0</strong> or <strong>≥ Wks to Lowest</strong> for one straight ramp Target → Lowest. <strong>0</strong> on <strong>Wks to Lowest</strong> = always Target.
+            Drag the <strong>grip</strong> on a row to reorder; if two rows share the same Final Occ. %, the <strong>lower</strong> row in the table wins.
           </p>
           <div class="tiers-editor">
             <table class="tiers-table tiers-table-pacing">
               <thead>
                 <tr>
+                  <th class="tiers-drag-col" scope="col" title="Drag grip to reorder rows"></th>
                   <th title="LY final expected % at or above this → use this row">Final Occ. %</th>
                   <th title="Price percentile when stay is at least Wks to Lowest away">Target Pctl %</th>
                   <th title="Intermediate step between Target and Lowest Pctl%">Lower Pctl %</th>
