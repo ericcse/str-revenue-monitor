@@ -271,6 +271,13 @@
             <div class="modal-actions tiers-modal-actions">
               <button type="button" id="addPacingRow" class="btn-secondary">Add row</button>
               <button type="button" id="savePacingSettings" class="upload-btn">Save settings</button>
+              <button type="button" id="savePacingSettingsJson" class="btn-secondary" title="Download current pacing settings as JSON">
+                Save pacing setting
+              </button>
+              <button type="button" id="loadPacingSettingsJson" class="btn-secondary" title="Load pacing settings from a JSON file">
+                Load pacing setting
+              </button>
+              <input type="file" id="pacingSettingsFileInput" accept=".json,application/json" hidden />
               <button type="button" id="savePacingDefaults" class="btn-secondary" title="Store current rows as the template for Reset to defaults">
                 Save as defaults
               </button>

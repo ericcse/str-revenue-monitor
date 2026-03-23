@@ -1,0 +1,43 @@
+{
+  "type": "str-revenue-monitor-pacing-settings",
+  "version": 1,
+  "exportedAt": "2026-03-23T07:03:59.115Z",
+  "pacingRows": [
+    {
+      "id": "r-high",
+      "finalOccupancyPct": 80,
+      "targetPricePercentile": 80,
+      "lowestPricePercentile": 40,
+      "weeksToStartReducing": 2,
+      "lowerPercentileTo": 60,
+      "weeksAhead": 6
+    },
+    {
+      "id": "r-mid",
+      "finalOccupancyPct": 60,
+      "targetPricePercentile": 60,
+      "lowestPricePercentile": 25,
+      "weeksToStartReducing": 3,
+      "lowerPercentileTo": 50,
+      "weeksAhead": 8
+    },
+    {
+      "id": "r-low",
+      "finalOccupancyPct": 40,
+      "targetPricePercentile": 40,
+      "lowestPricePercentile": 5,
+      "weeksToStartReducing": 6,
+      "lowerPercentileTo": 25,
+      "weeksAhead": 12
+    },
+    {
+      "id": "r-mn2u57rt-7xfzti9",
+      "finalOccupancyPct": 10,
+      "targetPricePercentile": 25,
+      "lowestPricePercentile": 2,
+      "weeksToStartReducing": 6,
+      "lowerPercentileTo": 5,
+      "weeksAhead": 12
+    }
+  ]
+}

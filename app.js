@@ -3200,6 +3200,51 @@ function init() {
     document.getElementById('settingsOverlay').hidden = true;
     render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
   });
+  document.getElementById('savePacingSettingsJson')?.addEventListener('click', () => {
+    const tbody = document.getElementById('tiersTableBody');
+    const rows = tbody ? readPacingRowsFromFormBody(tbody) : [];
+    const exportRows = rows.length ? rows : loadPacingTiers();
+    const payload = {
+      type: 'str-revenue-monitor-pacing-settings',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      pacingRows: exportRows,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-');
+    a.href = url;
+    a.download = `pacing-settings-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+  document.getElementById('loadPacingSettingsJson')?.addEventListener('click', () => {
+    document.getElementById('pacingSettingsFileInput')?.click();
+  });
+  document.getElementById('pacingSettingsFileInput')?.addEventListener('change', (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || '').trim());
+        const rawRows = pacingRowsFromJsonPayload(parsed);
+        const rows = normalizePacingRowsFromStorage(rawRows);
+        if (!rows || !rows.length) throw new Error('No valid pacing rows found in file.');
+        savePacingTiers(rows);
+        populateTiersTable(rows);
+        render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
+      } catch (err) {
+        alert(`Could not load pacing settings JSON: ${err.message || String(err)}`);
+      } finally {
+        e.target.value = '';
+      }
+    };
+    reader.readAsText(f);
+  });
   document.getElementById('resetPacingSettings').addEventListener('click', () => {
     const defs = JSON.parse(JSON.stringify(loadUserPacingDefaults()));
     savePacingTiers(defs);
@@ -3429,6 +3474,15 @@ function savePacingDefaultsFromForm() {
   let rows = readPacingRowsFromFormBody(tbody);
   if (rows.length === 0) rows = JSON.parse(JSON.stringify(loadUserPacingDefaults()));
   saveUserPacingDefaults(rows);
+}
+
+function pacingRowsFromJsonPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return null;
+  if (Array.isArray(payload.pacingRows)) return payload.pacingRows;
+  if (Array.isArray(payload.rows)) return payload.rows;
+  if (Array.isArray(payload.settings)) return payload.settings;
+  return null;
 }
 
 init();
