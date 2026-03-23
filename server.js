@@ -163,6 +163,41 @@ function addDaysToYMD(ymd, daysToAdd) {
   return `${y}-${mo}-${da}`;
 }
 
+/** Parse money-like inputs from Hospitable payloads ("$1,234.56", numbers, etc). */
+function toMoneyNumber(v) {
+  if (v == null || v === '') return 0;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  const n = parseFloat(String(v).replace(/[$€£,\s]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function pickPath(obj, path) {
+  let cur = obj;
+  for (const key of path) {
+    if (!cur || typeof cur !== 'object') return undefined;
+    cur = cur[key];
+  }
+  return cur;
+}
+
+/**
+ * Hospitable financial nodes often look like:
+ * { amount: 87500, formatted: "$875.00", ... } where amount is in minor units (cents).
+ */
+function toMoneyFromFinancialNode(node) {
+  if (node == null) return 0;
+  if (typeof node === 'number' || typeof node === 'string') return toMoneyNumber(node);
+  if (typeof node !== 'object') return 0;
+  if (node.formatted != null) {
+    const byFmt = toMoneyNumber(node.formatted);
+    if (byFmt) return byFmt;
+  }
+  if (node.amount != null && Number.isFinite(Number(node.amount))) {
+    return Number(node.amount) / 100;
+  }
+  return 0;
+}
+
 // Normalize revenue + stay dates for the frontend.
 function mapReservationToMonitorShape(r) {
   const row = flattenHospitableReservation(r);
@@ -171,21 +206,50 @@ function mapReservationToMonitorShape(r) {
   // Financials may live on resource or under included[] — keep best-effort.
   const financials = row.financials || row.financial || {};
 
-  const accommodation =
-    Number(financials.accommodationAmount || financials.accommodation || financials.accommodation_amount || 0) ||
-    0;
-  const hostPayout =
-    Number(
-      financials.hostPayoutAmount ||
-        financials.hostAmount ||
-        financials.host_payout ||
-        financials.host_amount ||
-        0
-    ) || 0;
-  const totalPayout =
-    Number(
-      financials.totalPayoutAmount || financials.totalAmount || financials.total || financials.total_amount || 0
-    ) || 0;
+  // Flat fallback fields (legacy / alternative payload shapes)
+  const accommodationFlat = toMoneyNumber(
+    financials.accommodationAmount ??
+      financials.accommodation ??
+      financials.accommodation_amount ??
+      row.accommodationAmount ??
+      row.accommodation ??
+      row.accommodation_amount
+  );
+  const hostPayoutFlat = toMoneyNumber(
+    financials.hostPayoutAmount ??
+      financials.hostAmount ??
+      financials.host_payout ??
+      financials.host_amount ??
+      row.hostPayoutAmount ??
+      row.hostAmount ??
+      row.host_payout ??
+      row.host_amount
+  );
+  const totalPayoutFlat = toMoneyNumber(
+    financials.totalPayoutAmount ??
+      financials.totalAmount ??
+      financials.total ??
+      financials.total_amount ??
+      row.totalPayoutAmount ??
+      row.totalAmount ??
+      row.total ??
+      row.total_amount
+  );
+
+  // Nested Hospitable v2 shape (financials.guest.*, financials.host.*)
+  const accommodationNested =
+    toMoneyFromFinancialNode(pickPath(financials, ['host', 'accommodation'])) ||
+    toMoneyFromFinancialNode(pickPath(financials, ['guest', 'accommodation']));
+  const hostPayoutNested = toMoneyFromFinancialNode(
+    pickPath(financials, ['host', 'total_payout'])
+  );
+  const totalPayoutNested = toMoneyFromFinancialNode(
+    pickPath(financials, ['guest', 'total_price'])
+  );
+
+  const accommodation = accommodationFlat || accommodationNested || 0;
+  const hostPayout = hostPayoutFlat || hostPayoutNested || 0;
+  const totalPayout = totalPayoutFlat || totalPayoutNested || 0;
 
   // Hospitable: arrival_date / departure_date are the canonical stay nights (checkout day exclusive).
   // Do NOT prefer check_in before arrival_date — timestamps can extend the computed stay incorrectly.

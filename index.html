@@ -135,28 +135,12 @@
       <!-- Revenue metrics -->
       <section class="card card-compact-metrics">
         <h2>Revenue metrics</h2>
-        <p class="card-desc">Current period performance</p>
-        <div class="metrics-row">
-          <div class="metric-tile">
-            <span class="tile-label">Revenue</span>
-            <span class="tile-value" id="revenue">—</span>
-          </div>
-          <div class="metric-tile">
-            <span class="tile-label">ADR</span>
-            <span class="tile-value" id="adr">—</span>
-          </div>
-          <div class="metric-tile">
-            <span class="tile-label">Occupancy %</span>
-            <span class="tile-value" id="occupancy">—</span>
-          </div>
-          <div class="metric-tile">
-            <span class="tile-label">RevPAR</span>
-            <span class="tile-value" id="revpar">—</span>
-          </div>
-          <div class="metric-tile">
-            <span class="tile-label">Nights booked</span>
-            <span class="tile-value" id="nightsBooked">—</span>
-          </div>
+        <p class="card-desc">Current period performance · month bars match your Unbooked horizon (forward from this month)</p>
+        <div class="revenue-metrics-chart-wrap" id="revenueMetricsChartWrap" hidden>
+          <canvas
+            id="revenueMetricsChart"
+            aria-label="Stacked bar chart: booked and unbooked nights per calendar month, plus check-in revenue on the right axis"
+          ></canvas>
         </div>
       </section>
       </div>

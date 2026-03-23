@@ -34,6 +34,7 @@ const UNBOOKED_PERIOD_TABLE_LOOKAHEAD_DAYS = 370;
 
 let futurePacingChartInstance = null;
 let futurePacingChartResizeObserver = null;
+let revenueMetricsChartInstance = null;
 let chartDataLabelsPluginRegistered = false;
 
 function ensureChartDataLabelsRegistered() {
@@ -279,6 +280,256 @@ function computePeriodMetrics(reservations, periodStart, periodEnd) {
   const adr = nights > 0 ? revenue / nights : 0;
   const revpar = totalDays > 0 ? revenue / totalDays : 0;
   return { revenue, nights, totalDays, occupancy, adr, revpar };
+}
+
+/**
+ * Forward `numMonths` calendar months starting with the current month (left → right).
+ * Booked = guest nights (check-in inclusive, check-out exclusive). Unbooked = days in month − booked.
+ */
+function buildForwardMonthlyBookedUnbookedNights(reservations, numMonths) {
+  const labels = [];
+  const bookedArr = [];
+  const unbookedArr = [];
+  const anchor = new Date();
+  anchor.setDate(1);
+  anchor.setHours(12, 0, 0, 0);
+  const n = Math.max(1, Math.min(12, Math.floor(Number(numMonths)) || 1));
+  for (let i = 0; i < n; i++) {
+    const d = new Date(anchor.getFullYear(), anchor.getMonth() + i, 1, 12, 0, 0, 0);
+    const y = d.getFullYear();
+    const m = d.getMonth();
+    const daysInMonth = new Date(y, m + 1, 0).getDate();
+    const bookedSet = new Set();
+    for (const r of reservations) {
+      if (!r.checkIn || !r.checkOut) continue;
+      const cin = parseYMDLocal(r.checkIn);
+      const cout = parseYMDLocal(r.checkOut);
+      if (isNaN(cin.getTime()) || isNaN(cout.getTime()) || cout <= cin) continue;
+      for (let cur = new Date(cin); cur < cout; cur.setDate(cur.getDate() + 1)) {
+        if (cur.getFullYear() === y && cur.getMonth() === m) bookedSet.add(toYMDLocal(cur));
+      }
+    }
+    const booked = bookedSet.size;
+    const unbooked = Math.max(0, daysInMonth - booked);
+    labels.push(d.toLocaleString(undefined, { month: 'short', year: '2-digit' }));
+    bookedArr.push(booked);
+    unbookedArr.push(unbooked);
+  }
+  return { labels, booked: bookedArr, unbooked: unbookedArr };
+}
+
+/**
+ * Forward `numMonths` calendar months starting with current month.
+ * Revenue attributed to each reservation's *check-in month* (not prorated by nights).
+ */
+function buildForwardMonthlyCheckInRevenue(reservations, numMonths) {
+  const revenueArr = [];
+  const firstRevenueLinesArr = [];
+  const anchor = new Date();
+  anchor.setDate(1);
+  anchor.setHours(12, 0, 0, 0);
+  const n = Math.max(1, Math.min(12, Math.floor(Number(numMonths)) || 1));
+  for (let i = 0; i < n; i++) {
+    const d = new Date(anchor.getFullYear(), anchor.getMonth() + i, 1, 12, 0, 0, 0);
+    const y = d.getFullYear();
+    const m = d.getMonth();
+    let sum = 0;
+    const monthEntries = [];
+    for (const r of reservations) {
+      if (!r.checkIn) continue;
+      const cin = parseYMDLocal(r.checkIn);
+      if (isNaN(cin.getTime())) continue;
+      if (cin.getFullYear() === y && cin.getMonth() === m) {
+        const rev = Number(r.revenue) || 0;
+        sum += rev;
+        monthEntries.push({ checkIn: r.checkIn, revenue: rev });
+      }
+    }
+    revenueArr.push(sum);
+    monthEntries.sort((a, b) => String(a.checkIn).localeCompare(String(b.checkIn)));
+    firstRevenueLinesArr.push(
+      monthEntries
+        .slice(0, 4)
+        .map((x) => `${String(x.checkIn).slice(5)}: $${Math.round(Number(x.revenue) || 0).toLocaleString()}`)
+    );
+  }
+  return { totals: revenueArr, firstRevenueLines: firstRevenueLinesArr };
+}
+
+/** Maps Unbooked dropdown days → how many forward calendar months the revenue chart shows. */
+function unbookedHorizonDaysToRevenueChartMonths(days) {
+  const d = normalizeUnbookedHorizonDays(days);
+  const map = { 30: 1, 120: 4, 180: 6, 270: 9, 365: 12 };
+  return map[d] ?? Math.max(1, Math.min(12, Math.round(d / 30)));
+}
+
+function destroyRevenueMetricsChart() {
+  if (revenueMetricsChartInstance) {
+    revenueMetricsChartInstance.destroy();
+    revenueMetricsChartInstance = null;
+  }
+}
+
+function renderRevenueMetricsChart(reservations) {
+  const wrap = document.getElementById('revenueMetricsChartWrap');
+  const canvas = document.getElementById('revenueMetricsChart');
+  if (!wrap || !canvas || typeof Chart === 'undefined') return;
+  if (!reservations || !reservations.length) {
+    destroyRevenueMetricsChart();
+    wrap.hidden = true;
+    return;
+  }
+  const horizonDays = getUnbookedHorizonDays();
+  const numMonths = unbookedHorizonDaysToRevenueChartMonths(horizonDays);
+  const { labels, booked, unbooked } = buildForwardMonthlyBookedUnbookedNights(reservations, numMonths);
+  const { totals: checkInRevenue, firstRevenueLines } = buildForwardMonthlyCheckInRevenue(
+    reservations,
+    numMonths
+  );
+  wrap.hidden = false;
+  destroyRevenueMetricsChart();
+  ensureChartDataLabelsRegistered();
+  const tickColor = '#9aa5b4';
+  const gridColor = 'rgba(255, 255, 255, 0.06)';
+  const revenueTickColor = 'rgba(90, 235, 120, 0.95)';
+  revenueMetricsChartInstance = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Nights booked',
+          data: booked,
+          stack: 'nights',
+          backgroundColor: 'rgba(118, 124, 136, 0.74)',
+          borderRadius: { topLeft: 0, topRight: 0, bottomLeft: 3, bottomRight: 3 },
+        },
+        {
+          label: 'Nights unbooked',
+          data: unbooked,
+          stack: 'nights',
+          backgroundColor: 'rgba(88, 166, 255, 0.46)',
+          borderRadius: { topLeft: 3, topRight: 3, bottomLeft: 0, bottomRight: 0 },
+          datalabels: {
+            display(ctx) {
+              const v = ctx.dataset.data?.[ctx.dataIndex];
+              return Number.isFinite(Number(v)) && Number(v) > 0;
+            },
+            formatter(v) {
+              return `${Math.round(Number(v))}`;
+            },
+            color: 'rgba(235, 241, 248, 0.95)',
+            font: { weight: '700', size: 10, family: "'JetBrains Mono', monospace" },
+            anchor: 'center',
+            align: 'center',
+            clip: true,
+          },
+        },
+        {
+          label: 'Check-in revenue',
+          data: checkInRevenue,
+          yAxisID: 'y1',
+          stack: 'revenue',
+          backgroundColor: 'rgba(63, 185, 80, 0.42)',
+          borderColor: 'rgba(63, 185, 80, 0.9)',
+          borderWidth: 1,
+          borderRadius: { topLeft: 3, topRight: 3, bottomLeft: 0, bottomRight: 0 },
+          datalabels: {
+            display(ctx) {
+              const v = ctx.dataset.data?.[ctx.dataIndex];
+              return Number.isFinite(Number(v)) && Number(v) > 0;
+            },
+            formatter(v) {
+              return `$${Math.round(Number(v)).toLocaleString()}`;
+            },
+            color: 'rgba(90, 235, 120, 0.98)',
+            font: { weight: '700', size: 10, family: "'JetBrains Mono', monospace" },
+            anchor: 'end',
+            align: 'top',
+            offset: 2,
+            clip: false,
+          },
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        datalabels: { display: false },
+        legend: {
+          position: 'bottom',
+          labels: { color: tickColor, boxWidth: 12, padding: 8, font: { size: 10 } },
+        },
+        tooltip: {
+          callbacks: {
+            label(ctx) {
+              const raw = ctx.raw;
+              if (ctx.dataset?.yAxisID === 'y1') {
+                const v = Number(raw);
+                return `${ctx.dataset.label}: $${Number.isFinite(v) ? Math.round(v).toLocaleString() : '—'}`;
+              }
+              const v = Number(raw);
+              return `${ctx.dataset.label}: ${Number.isFinite(v) ? Math.round(v) : '—'}`;
+            },
+            footer(tooltipItems) {
+              if (!tooltipItems.length) return '';
+              const idx = tooltipItems[0].dataIndex;
+              const b = booked[idx] ?? 0;
+              const u = unbooked[idx] ?? 0;
+              const rev = checkInRevenue[idx] ?? 0;
+              const lines = [
+                `Total nights in month: ${b + u} · Check-in revenue: $${Math.round(Number(rev) || 0).toLocaleString()}`,
+              ];
+              const first = firstRevenueLines[idx] || [];
+              if (first.length) {
+                lines.push('First check-ins:');
+                lines.push(...first);
+              }
+              return lines;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          stacked: true,
+          ticks: { color: tickColor, maxRotation: 45, minRotation: 0, font: { size: 10 } },
+          grid: { display: false },
+        },
+        y: {
+          stacked: true,
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: 'Nights',
+            color: tickColor,
+            font: { size: 11, weight: '600' },
+          },
+          ticks: { color: tickColor, precision: 0 },
+          grid: { color: gridColor },
+        },
+        y1: {
+          position: 'right',
+          beginAtZero: true,
+          title: {
+            display: true,
+            text: 'Revenue ($) — check-ins',
+            color: revenueTickColor,
+            font: { size: 11, weight: '600' },
+          },
+          grid: { drawOnChartArea: false, color: gridColor },
+          ticks: {
+            color: revenueTickColor,
+            callback(v) {
+              return Number.isFinite(Number(v)) ? `$${Math.round(Number(v)).toLocaleString()}` : v;
+            },
+          },
+        },
+      },
+    },
+  });
 }
 
 // --- Pacing ---
@@ -2320,6 +2571,11 @@ function formatMoneyWhole(v) {
   return `$${Math.round(Number(v)).toLocaleString()}`;
 }
 
+function setTextById(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
 const FUTURE_PACING_MONTH_SHORT = [
   'Jan',
   'Feb',
@@ -2476,11 +2732,11 @@ function render(reservations, periodKey, revenueTarget) {
   const horizonDays = getUnbookedHorizonDays();
   const pacingTiers = loadPacingTiers();
   if (!reservations || !reservations.length) {
-    document.getElementById('revenue').textContent = '—';
-    document.getElementById('adr').textContent = '—';
-    document.getElementById('occupancy').textContent = '—';
-    document.getElementById('revpar').textContent = '—';
-    document.getElementById('nightsBooked').textContent = '—';
+    setTextById('revenue', '—');
+    setTextById('adr', '—');
+    setTextById('occupancy', '—');
+    setTextById('revpar', '—');
+    setTextById('nightsBooked', '—');
     document.getElementById('revenuePace').textContent = '—';
     document.getElementById('occupancyPace').textContent = '—';
     document.getElementById('daysElapsed').textContent = '—';
@@ -2495,6 +2751,9 @@ function render(reservations, periodKey, revenueTarget) {
     const tableEl = document.getElementById('futurePacingTable');
     const chartsWrap = document.getElementById('futurePacingCharts');
     destroyFuturePacingCharts();
+    destroyRevenueMetricsChart();
+    const revChartWrap = document.getElementById('revenueMetricsChartWrap');
+    if (revChartWrap) revChartWrap.hidden = true;
     if (chartsWrap) chartsWrap.hidden = true;
     if (emptyHint) emptyHint.hidden = false;
     if (tableEl) tableEl.hidden = true;
@@ -2520,13 +2779,11 @@ function render(reservations, periodKey, revenueTarget) {
     horizonDays
   );
 
-  document.getElementById('revenue').textContent = `$${Math.round(metrics.revenue).toLocaleString()}`;
-  document.getElementById('adr').textContent =
-    metrics.adr > 0 ? `$${Math.round(metrics.adr).toLocaleString()}` : '—';
-  document.getElementById('occupancy').textContent = `${metrics.occupancy.toFixed(1)}%`;
-  document.getElementById('revpar').textContent =
-    metrics.revpar > 0 ? `$${metrics.revpar.toFixed(0)}` : '—';
-  document.getElementById('nightsBooked').textContent = String(metrics.nights);
+  setTextById('revenue', `$${Math.round(metrics.revenue).toLocaleString()}`);
+  setTextById('adr', metrics.adr > 0 ? `$${Math.round(metrics.adr).toLocaleString()}` : '—');
+  setTextById('occupancy', `${metrics.occupancy.toFixed(1)}%`);
+  setTextById('revpar', metrics.revpar > 0 ? `$${metrics.revpar.toFixed(0)}` : '—');
+  setTextById('nightsBooked', String(metrics.nights));
 
   document.getElementById('revenuePace').textContent =
     pacing.revenuePace != null ? `${pacing.revenuePace.toFixed(0)}%` : '—';
@@ -2662,6 +2919,7 @@ function render(reservations, periodKey, revenueTarget) {
   }
   syncFuturePacingTableToolbarVisibility();
   renderFuturePacingCharts(futurePeriodsWithMarket);
+  renderRevenueMetricsChart(reservations);
   renderMarketCsvPanel();
 }
 

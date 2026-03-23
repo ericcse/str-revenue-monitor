@@ -325,6 +325,17 @@ body {
   font-size: 1.02rem;
 }
 
+.revenue-metrics-chart-wrap {
+  margin-top: 0.85rem;
+  height: 220px;
+  position: relative;
+  width: 100%;
+}
+
+.top-metrics-row .revenue-metrics-chart-wrap {
+  height: 200px;
+}
+
 /* Pacing card only — extra compact vs revenue metrics */
 .top-metrics-row .card-pacing.card-compact-metrics {
   padding: 0.75rem 0.9rem;
