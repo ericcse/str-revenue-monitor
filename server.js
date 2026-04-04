@@ -190,12 +190,50 @@ function toMoneyFromFinancialNode(node) {
   if (typeof node !== 'object') return 0;
   if (node.formatted != null) {
     const byFmt = toMoneyNumber(node.formatted);
-    if (byFmt) return byFmt;
+    if (Number.isFinite(byFmt)) return byFmt;
   }
   if (node.amount != null && Number.isFinite(Number(node.amount))) {
     return Number(node.amount) / 100;
   }
   return 0;
+}
+
+/**
+ * Host net (check-in month revenue on Hospitable) — try nested financials + flat fields.
+ * Returns undefined only when no host amount exists (caller may fall back to accommodation).
+ */
+function extractHostNetPayoutUsd(financials, row) {
+  const nestedPaths = [
+    ['host', 'total_payout'],
+    ['host', 'payout'],
+    ['host', 'net_payout'],
+    ['host', 'net'],
+    ['host', 'total'],
+    ['host', 'amount'],
+    ['payout'],
+  ];
+  for (const path of nestedPaths) {
+    const node = pickPath(financials, path);
+    if (node == null || node === '') continue;
+    const v = toMoneyFromFinancialNode(node);
+    if (Number.isFinite(v)) return v;
+  }
+  const flatCandidates = [
+    row.hostPayoutAmount,
+    row.hostAmount,
+    row.host_payout,
+    row.host_amount,
+    financials.hostPayoutAmount,
+    financials.hostAmount,
+    financials.host_payout,
+    financials.host_amount,
+  ];
+  for (const raw of flatCandidates) {
+    if (raw == null || raw === '') continue;
+    const v = toMoneyNumber(raw);
+    if (Number.isFinite(v)) return v;
+  }
+  return undefined;
 }
 
 // Normalize revenue + stay dates for the frontend.
@@ -240,7 +278,7 @@ function mapReservationToMonitorShape(r) {
   const accommodationNested =
     toMoneyFromFinancialNode(pickPath(financials, ['host', 'accommodation'])) ||
     toMoneyFromFinancialNode(pickPath(financials, ['guest', 'accommodation']));
-  const hostPayoutNested = toMoneyFromFinancialNode(
+  const hostPayoutNestedLegacy = toMoneyFromFinancialNode(
     pickPath(financials, ['host', 'total_payout'])
   );
   const totalPayoutNested = toMoneyFromFinancialNode(
@@ -248,8 +286,13 @@ function mapReservationToMonitorShape(r) {
   );
 
   const accommodation = accommodationFlat || accommodationNested || 0;
-  const hostPayout = hostPayoutFlat || hostPayoutNested || 0;
   const totalPayout = totalPayoutFlat || totalPayoutNested || 0;
+
+  const hostNetUsd = extractHostNetPayoutUsd(financials, row);
+  const hostPayout =
+    hostNetUsd !== undefined
+      ? hostNetUsd
+      : hostPayoutFlat || hostPayoutNestedLegacy || 0;
 
   // Hospitable: arrival_date / departure_date are the canonical stay nights (checkout day exclusive).
   // Do NOT prefer check_in before arrival_date — timestamps can extend the computed stay incorrectly.
@@ -285,10 +328,15 @@ function mapReservationToMonitorShape(r) {
 
   if (!checkIn || !checkOut || checkOut <= checkIn) return null;
 
+  // Net to host (Hospitable check-in month). Prefer extracted host net; do **not** fall back to guest
+  // total_price (inflates vs dashboard). If host net is missing, use accommodation only.
+  const revenue =
+    hostNetUsd !== undefined ? hostNetUsd : accommodation > 0 ? accommodation : 0;
+
   return {
     checkIn,
     checkOut,
-    revenue: accommodation || hostPayout || totalPayout || 0,
+    revenue,
     accommodation,
     hostPayout,
     totalPayout,
@@ -514,6 +562,9 @@ app.get('/api/hospitable/reservations', async (req, res) => {
         checkIn: r.checkIn,
         checkOut: r.checkOut,
         revenue: r.revenue,
+        hostPayout: r.hostPayout,
+        accommodation: r.accommodation,
+        totalPayout: r.totalPayout,
       })),
       diagnostics: {
         rawReservationObjects: all.length,

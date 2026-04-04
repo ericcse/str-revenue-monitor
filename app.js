@@ -16,6 +16,8 @@ const STORAGE_KEYS = {
   hospitableAsOf: 'str-monitor-hospitable-as-of',
   /** Future pacing table: extra columns visible (Cur, LYT, Rm LY, P25–P90). */
   futurePacingTableDetailsVisible: 'str-monitor-future-table-details',
+  /** `summary` (default) or `full` — future pacing table column layout. */
+  futurePacingTableView: 'str-monitor-future-table-view',
 };
 
 /** Revenue/pacing cards use this calendar window (month = current month only). */
@@ -320,7 +322,8 @@ function buildForwardMonthlyBookedUnbookedNights(reservations, numMonths) {
 
 /**
  * Forward `numMonths` calendar months starting with current month.
- * Revenue attributed to each reservation's *check-in month* (not prorated by nights).
+ * For each reservation, **100% of the amount is counted in the calendar month of the check-in date
+ * (YYYY-MM-DD) only**. Check-out in a later month does not move revenue (same as Hospitable check-in month).
  */
 function buildForwardMonthlyCheckInRevenue(reservations, numMonths) {
   const revenueArr = [];
@@ -337,23 +340,86 @@ function buildForwardMonthlyCheckInRevenue(reservations, numMonths) {
     const monthEntries = [];
     for (const r of reservations) {
       if (!r.checkIn) continue;
-      const cin = parseYMDLocal(r.checkIn);
-      if (isNaN(cin.getTime())) continue;
-      if (cin.getFullYear() === y && cin.getMonth() === m) {
-        const rev = Number(r.revenue) || 0;
-        sum += rev;
-        monthEntries.push({ checkIn: r.checkIn, revenue: rev });
-      }
+      if (!checkInYmdIsInCalendarMonth(r.checkIn, y, m)) continue;
+      const rev = reservationCheckInMonthRevenueAmount(r);
+      sum += rev;
+      monthEntries.push({ checkIn: r.checkIn, revenue: rev });
     }
     revenueArr.push(sum);
     monthEntries.sort((a, b) => String(a.checkIn).localeCompare(String(b.checkIn)));
     firstRevenueLinesArr.push(
       monthEntries
         .slice(0, 4)
-        .map((x) => `${String(x.checkIn).slice(5)}: $${Math.round(Number(x.revenue) || 0).toLocaleString()}`)
+        .map((x) => `${String(x.checkIn).slice(5)}: ${formatUsd2(x.revenue)}`)
     );
   }
   return { totals: revenueArr, firstRevenueLines: firstRevenueLinesArr };
+}
+
+/**
+ * One calendar month: guest nights booked (nights falling in that month), total calendar nights,
+ * and revenue (same as chart: **full booking `revenue` in the check-in month only** — not split
+ * across months when a stay spans two months).
+ */
+function computeCalendarMonthOccupancyMetrics(reservations, year, month0) {
+  const y = Number(year);
+  const m = Number(month0);
+  if (!Number.isFinite(y) || !Number.isFinite(m) || m < 0 || m > 11) return null;
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const bookedSet = new Set();
+  for (const r of reservations || []) {
+    if (!r.checkIn || !r.checkOut) continue;
+    const cin = parseYMDLocal(r.checkIn);
+    const cout = parseYMDLocal(r.checkOut);
+    if (isNaN(cin.getTime()) || isNaN(cout.getTime()) || cout <= cin) continue;
+    for (let cur = new Date(cin); cur < cout; cur.setDate(cur.getDate() + 1)) {
+      if (cur.getFullYear() === y && cur.getMonth() === m) bookedSet.add(toYMDLocal(cur));
+    }
+  }
+  const bookedNights = bookedSet.size;
+  let revenue = 0;
+  for (const r of reservations || []) {
+    if (!r.checkIn) continue;
+    if (!checkInYmdIsInCalendarMonth(r.checkIn, y, m)) continue;
+    revenue += reservationCheckInMonthRevenueAmount(r);
+  }
+  return {
+    revenue,
+    bookedNights,
+    totalNights: daysInMonth,
+    unbookedNights: Math.max(0, daysInMonth - bookedNights),
+  };
+}
+
+function buildFuturePacingSummaryMonthCellInnerHtml(monthLabel, groupTitle, metrics) {
+  const stackTitle = escapeHtmlAttr(groupTitle);
+  let revHtml;
+  let barHtml;
+  if (!metrics || metrics.totalNights <= 0) {
+    revHtml = `<div class="fp-summary-month-rev">—</div>`;
+    barHtml = `<div class="fp-summary-month-nights fp-summary-month-nights--empty" aria-hidden="true">—</div>`;
+  } else {
+    const revStr = formatUsd2(metrics.revenue);
+    const pct = Math.min(100, Math.max(0, (metrics.bookedNights / metrics.totalNights) * 100));
+    const tip = escapeHtmlAttr(
+      `${metrics.bookedNights} guest nights in this month of ${metrics.totalNights} calendar nights · ${revStr} check-in revenue — full booking in check-in month (e.g. May check-in / June check-out counts in May; Hospitable net ≈ host payout when available)`
+    );
+    revHtml = `<div class="fp-summary-month-rev" title="${tip}">${escapeHtml(revStr)}</div>`;
+    const barAria = escapeHtmlAttr(
+      `${metrics.bookedNights} of ${metrics.totalNights} nights booked in this calendar month`
+    );
+    barHtml = `<div class="fp-summary-month-nights" title="${tip}">
+      <div class="fp-summary-month-nights__track" role="img" aria-label="${barAria}">
+        <div class="fp-summary-month-nights__booked" style="width: ${pct.toFixed(2)}%"></div>
+      </div>
+      <div class="fp-summary-month-nights__lbl">${metrics.bookedNights} / ${metrics.totalNights}</div>
+    </div>`;
+  }
+  return `<div class="fp-summary-month-stack" title="${stackTitle}">
+    <div class="fp-summary-month-stack__label">${escapeHtml(monthLabel)}</div>
+    ${revHtml}
+    ${barHtml}
+  </div>`;
 }
 
 /** Maps Unbooked dropdown days → how many forward calendar months the revenue chart shows. */
@@ -440,7 +506,7 @@ function renderRevenueMetricsChart(reservations) {
               return Number.isFinite(Number(v)) && Number(v) > 0;
             },
             formatter(v) {
-              return `$${Math.round(Number(v)).toLocaleString()}`;
+              return formatUsd2(v);
             },
             color: 'rgba(90, 235, 120, 0.98)',
             font: { weight: '700', size: 10, family: "'JetBrains Mono', monospace" },
@@ -468,7 +534,7 @@ function renderRevenueMetricsChart(reservations) {
               const raw = ctx.raw;
               if (ctx.dataset?.yAxisID === 'y1') {
                 const v = Number(raw);
-                return `${ctx.dataset.label}: $${Number.isFinite(v) ? Math.round(v).toLocaleString() : '—'}`;
+                return `${ctx.dataset.label}: ${Number.isFinite(v) ? formatUsd2(v) : '—'}`;
               }
               const v = Number(raw);
               return `${ctx.dataset.label}: ${Number.isFinite(v) ? Math.round(v) : '—'}`;
@@ -480,7 +546,8 @@ function renderRevenueMetricsChart(reservations) {
               const u = unbooked[idx] ?? 0;
               const rev = checkInRevenue[idx] ?? 0;
               const lines = [
-                `Total nights in month: ${b + u} · Check-in revenue: $${Math.round(Number(rev) || 0).toLocaleString()}`,
+                `Total nights in month: ${b + u} · Check-in revenue: ${formatUsd2(rev)}`,
+                'Revenue: full booking in the check-in calendar month (May check-in / June check-out → May). Net ≈ host payout when Hospitable provides it.',
               ];
               const first = firstRevenueLines[idx] || [];
               if (first.length) {
@@ -523,7 +590,7 @@ function renderRevenueMetricsChart(reservations) {
           ticks: {
             color: revenueTickColor,
             callback(v) {
-              return Number.isFinite(Number(v)) ? `$${Math.round(Number(v)).toLocaleString()}` : v;
+              return Number.isFinite(Number(v)) ? formatUsd2(v) : v;
             },
           },
         },
@@ -606,6 +673,36 @@ function parseYMDLocal(ymd) {
 }
 
 /**
+ * True if the reservation check-in is a calendar YYYY-MM-DD in `year` / `month0` (0–11).
+ * Uses the date string only (same month bucket as Hospitable check-in–month revenue).
+ */
+function checkInYmdIsInCalendarMonth(checkInYmd, year, month0) {
+  const s = String(checkInYmd || '').trim();
+  const m = /^(\d{4})-(\d{2})-\d{2}$/.exec(s);
+  if (!m) return false;
+  return Number(m[1]) === Number(year) && Number(m[2]) - 1 === Number(month0);
+}
+
+/**
+ * Dollar amount attributed to the check-in month (full booking, not split across months).
+ * Prefers `hostPayout` when present (Hospitable net to host); else `revenue` from the row / API.
+ */
+function reservationCheckInMonthRevenueAmount(r) {
+  if (!r) return 0;
+  if (r.hostPayout != null && r.hostPayout !== '') {
+    const hp = Number(r.hostPayout);
+    if (Number.isFinite(hp)) return hp;
+  }
+  return Number(r.revenue) || 0;
+}
+
+function formatUsd2(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/**
  * First and last calendar dates (YYYY-MM-DD) included in the unbooked window.
  * Exactly `daysAhead` nights: from "today" through today + (daysAhead - 1).
  */
@@ -648,6 +745,179 @@ function getUnbookedDates(reservations, fromDate, daysAhead = DEFAULT_UNBOOKED_H
     cur.setDate(cur.getDate() + 1);
   }
   return out;
+}
+
+/** Every guest night (check-in inclusive, check-out exclusive), as YYYY-MM-DD. */
+function buildBookedNightsSet(reservations) {
+  const booked = new Set();
+  if (!reservations || !reservations.length) return booked;
+  for (const r of reservations) {
+    if (!r.checkIn || !r.checkOut) continue;
+    const cin = parseYMDLocal(r.checkIn);
+    const cout = parseYMDLocal(r.checkOut);
+    if (isNaN(cin.getTime()) || isNaN(cout.getTime()) || cout <= cin) continue;
+    for (let d = new Date(cin); d < cout; d.setDate(d.getDate() + 1)) {
+      booked.add(toYMDLocal(d));
+    }
+  }
+  return booked;
+}
+
+/** List { y, m } (m = 0–11) for each calendar month overlapping [ymdA, ymdB] inclusive. */
+function monthsIntersectingYmdRange(ymdA, ymdB) {
+  const a = parseYMDLocal(ymdA);
+  const b = parseYMDLocal(ymdB);
+  if (isNaN(a.getTime()) || isNaN(b.getTime())) return [];
+  const start = a <= b ? a : b;
+  const end = a <= b ? b : a;
+  const out = [];
+  let y = start.getFullYear();
+  let m = start.getMonth();
+  const endY = end.getFullYear();
+  const endM = end.getMonth();
+  while (y < endY || (y === endY && m <= endM)) {
+    out.push({ y, m });
+    m += 1;
+    if (m > 11) {
+      m = 0;
+      y += 1;
+    }
+  }
+  return out;
+}
+
+const MINI_CAL_DOW_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+
+function buildOneMiniMonthCalendarHtml(bookedSet, year, month0, isHighlightYmd) {
+  const first = new Date(year, month0, 1, 12, 0, 0, 0);
+  const dim = new Date(year, month0 + 1, 0, 12, 0, 0, 0).getDate();
+  const pad = first.getDay();
+  const label = first.toLocaleString(undefined, { month: 'short', year: '2-digit' });
+  const inHighlight =
+    typeof isHighlightYmd === 'function'
+      ? (ymd) => isHighlightYmd(ymd)
+      : (ymd) => ymd >= isHighlightYmd.start && ymd <= isHighlightYmd.end;
+  let html = `<div class="mini-cal-month">`;
+  html += `<div class="mini-cal-month__title">${escapeHtml(label)}</div>`;
+  html += `<div class="mini-cal-month__dows">${MINI_CAL_DOW_LABELS.map(
+    (ch) => `<span class="mini-cal-month__dow-h">${escapeHtml(ch)}</span>`
+  ).join('')}</div>`;
+  html += `<div class="mini-cal-month__cells">`;
+  for (let i = 0; i < pad; i++) {
+    html += `<span class="mini-cal-day mini-cal-day--pad" aria-hidden="true"></span>`;
+  }
+  for (let day = 1; day <= dim; day++) {
+    const mm = String(month0 + 1).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    const ymd = `${year}-${mm}-${dd}`;
+    const inPeriod = inHighlight(ymd);
+    const isBooked = bookedSet.has(ymd);
+    const classes = ['mini-cal-day'];
+    if (isBooked) classes.push('mini-cal-day--booked');
+    else classes.push('mini-cal-day--unbooked');
+    if (inPeriod && !isBooked) classes.push('mini-cal-day--period');
+    const tip = inPeriod
+      ? isBooked
+        ? `${ymd} · booked · in this period`
+        : `${ymd} · unbooked · this period`
+      : isBooked
+        ? `${ymd} · booked`
+        : `${ymd} · unbooked`;
+    html += `<span class="${classes.join(' ')}" title="${escapeHtmlAttr(tip)}">${day}</span>`;
+  }
+  const totalCells = pad + dim;
+  const tail = totalCells % 7 === 0 ? 0 : 7 - (totalCells % 7);
+  for (let i = 0; i < tail; i++) {
+    html += `<span class="mini-cal-day mini-cal-day--pad" aria-hidden="true"></span>`;
+  }
+  html += `</div></div>`;
+  return html;
+}
+
+function buildFuturePeriodMiniCalendarsHtml(bookedSet, periodStartYmd, periodEndYmd) {
+  if (!periodStartYmd || !periodEndYmd) return '<span class="mini-cal-empty">—</span>';
+  const months = monthsIntersectingYmdRange(periodStartYmd, periodEndYmd);
+  if (!months.length) return '<span class="mini-cal-empty">—</span>';
+  const maxMonths = 3;
+  const slice = months.slice(0, maxMonths);
+  let html = `<div class="future-pacing-mini-cals">`;
+  const rangePred = { start: periodStartYmd, end: periodEndYmd };
+  for (const { y, m } of slice) {
+    html += buildOneMiniMonthCalendarHtml(bookedSet, y, m, rangePred);
+  }
+  if (months.length > maxMonths) {
+    html += `<span class="mini-cal-more" title="${escapeHtmlAttr(
+      `${months.length - maxMonths} more month(s) in this period`
+    )}">+${months.length - maxMonths} mo</span>`;
+  }
+  html += `</div>`;
+  return html;
+}
+
+/**
+ * 0–100% bar: grey = Cur %, color = (LY fin − Cur) so grey + color = LY fin; dim tail to 100%.
+ * Markers at Cur and LY fin. Data label shows remaining % (Rem column when present).
+ */
+function buildLyFinOccBarHtml(currentPct, remainingPct, lyFinPct) {
+  if (lyFinPct == null || !Number.isFinite(Number(lyFinPct))) {
+    return '<span class="lyfin-occ-bar-empty">—</span>';
+  }
+  const lyFin = Math.max(0, Math.min(100, Math.round(Number(lyFinPct))));
+  let cur =
+    currentPct != null && Number.isFinite(Number(currentPct))
+      ? Math.max(0, Math.min(100, Math.round(Number(currentPct))))
+      : 0;
+  if (cur > lyFin) cur = lyFin;
+  const remWidth = Math.max(0, lyFin - cur);
+  const remLabel =
+    remainingPct != null && Number.isFinite(Number(remainingPct))
+      ? Math.max(0, Math.round(Number(remainingPct)))
+      : remWidth;
+  const rest = Math.max(0, 100 - lyFin);
+  const labelCenter = lyFin > 0 ? cur + remWidth / 2 : 0;
+  const remStr = `${remLabel}%`;
+  const tip = `Cur ${cur}% + Rem ${remWidth}% = LY fin ${lyFin}% · tail to 100%: ${rest}%`;
+  const labelHtml =
+    remWidth > 0 || remLabel > 0
+      ? `<span class="lyfin-occ-bar__rem-label" style="left:${labelCenter}%" title="${escapeHtmlAttr(`Remaining ${remStr} (Rem)`)}">${escapeHtml(
+          remStr
+        )}</span>`
+      : '';
+  let curPinLeft = cur;
+  let lyFinPinLeft = lyFin;
+  if (cur === lyFin && cur > 0) {
+    curPinLeft = Math.max(0, cur - 2);
+    lyFinPinLeft = Math.min(100, lyFin + 2);
+  } else if (cur !== lyFin && Math.abs(curPinLeft - lyFinPinLeft) < 4) {
+    curPinLeft = Math.max(0, curPinLeft - 2);
+    lyFinPinLeft = Math.min(100, lyFinPinLeft + 2);
+  }
+  const curPinTitle = escapeHtmlAttr(`Current market occupancy (Cur): ${cur}%`);
+  const lyFinPinTitle = escapeHtmlAttr(`LY final expected (LY Fin): ${lyFin}%`);
+  return `<div class="lyfin-occ-bar" title="${escapeHtmlAttr(tip)}">
+  <div class="lyfin-occ-bar__track-wrap">
+    ${labelHtml}
+    <div class="lyfin-occ-bar__track" role="img" aria-label="${escapeHtmlAttr(tip)}">
+      <div class="lyfin-occ-bar__seg-row">
+        <div class="lyfin-occ-bar__seg lyfin-occ-bar__seg--grey" style="width:${cur}%"></div>
+        <div class="lyfin-occ-bar__seg lyfin-occ-bar__seg--rem" style="width:${remWidth}%"></div>
+        <div class="lyfin-occ-bar__seg lyfin-occ-bar__seg--tail" style="width:${rest}%"></div>
+      </div>
+      <div class="lyfin-occ-bar__mark-layer">
+        <div class="lyfin-occ-bar__pin lyfin-occ-bar__pin--cur" style="left:${curPinLeft}%" title="${curPinTitle}">
+          <span class="lyfin-occ-bar__pin-knob" aria-hidden="true"></span>
+          <span class="lyfin-occ-bar__pin-stem" aria-hidden="true"></span>
+          <span class="lyfin-occ-bar__pin-label">${cur}%</span>
+        </div>
+        <div class="lyfin-occ-bar__pin lyfin-occ-bar__pin--lyfin" style="left:${lyFinPinLeft}%" title="${lyFinPinTitle}">
+          <span class="lyfin-occ-bar__pin-knob" aria-hidden="true"></span>
+          <span class="lyfin-occ-bar__pin-stem" aria-hidden="true"></span>
+          <span class="lyfin-occ-bar__pin-label">${lyFin}%</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>`;
 }
 
 /** True if a Fri–Thu period intersects the user's selected unbooked window [firstYmd, lastYmd]. */
@@ -876,14 +1146,19 @@ function computeRecPctlPercentileFromWksAway(tier, wksAway, _lyFinPct) {
   return Math.round(clampPct0to100(tgt + u * (lower - tgt)));
 }
 
-/** Mini number line: T/L/F = Target, Lower, Lowest; arrow = resolved Rec. Pctl % (when present). */
-function buildRecPctlNumberLineHtml(tier, recPctResolved) {
+/**
+ * Mini number line: T/L/F = Target, Lower, Lowest.
+ * Orange ▼ = Rec. Pctl %; blue ● = Fin % (final price vs P25–P90 ladder), when present.
+ */
+function buildRecPctlNumberLineHtml(tier, recPctResolved, finPctResolved) {
   if (!tier) return '<span class="rec-pctl-line-empty" aria-hidden="true">—</span>';
   const tgt = clampPct0to100(tier.targetPricePercentile);
   const lower = clampPct0to100(tier.lowerPercentileTo);
   const floor = clampPct0to100(tier.lowestPricePercentile);
   const hasRec = recPctResolved != null && Number.isFinite(Number(recPctResolved));
   const rec = hasRec ? clampPct0to100(recPctResolved) : null;
+  const hasFin = finPctResolved != null && Number.isFinite(Number(finPctResolved));
+  const fin = hasFin ? clampPct0to100(finPctResolved) : null;
 
   const VB_W = 200;
   const VB_H = 60;
@@ -893,8 +1168,8 @@ function buildRecPctlNumberLineHtml(tier, recPctResolved) {
   const yWks = 44;
   const yNum = 56;
   const innerW = VB_W - 2 * PAD;
-  /** Map percentile to x: higher % on the left, lower % on the right (mirrored 0–100). */
-  const toX = (p) => VB_W - PAD - (clampPct0to100(p) / 100) * innerW;
+  /** Map percentile to x: lower % on the left, higher % on the right (0–100 left to right). */
+  const toX = (p) => PAD + (clampPct0to100(p) / 100) * innerW;
 
   const xT = toX(tgt);
   const xL = toX(lower);
@@ -908,8 +1183,11 @@ function buildRecPctlNumberLineHtml(tier, recPctResolved) {
     { pct: floor, mark: 'F', tip: `Lowest ${floor}%` },
   ];
 
-  const tipSuffix = hasRec ? ` · Arrow: Rec. ${rec}%` : '';
-  let html = `<div class="rec-pctl-line-wrap" title="T = Target · L = Lower · F = Lowest · scale: high % left, low % right${tipSuffix}">`;
+  const tipBits = [];
+  if (hasRec) tipBits.push(`Orange ▼ Rec. ${rec}%`);
+  if (hasFin) tipBits.push(`Blue ● Fin ${fin}%`);
+  const tipSuffix = tipBits.length ? ` · ${tipBits.join(' · ')}` : '';
+  let html = `<div class="rec-pctl-line-wrap" title="T = Target · L = Lower · F = Lowest · scale: low % left, high % right${tipSuffix}">`;
   html += `<svg class="rec-pctl-line" viewBox="0 0 ${VB_W} ${VB_H}" xmlns="http://www.w3.org/2000/svg" focusable="false" aria-hidden="true">`;
   html += `<line class="rec-pctl-line__axis" x1="${PAD}" y1="${BAR_Y}" x2="${VB_W - PAD}" y2="${BAR_Y}"/>`;
 
@@ -938,8 +1216,21 @@ function buildRecPctlNumberLineHtml(tier, recPctResolved) {
     html += `</g>`;
   }
 
+  let rx = hasRec ? toX(rec) : null;
+  let finX = hasFin ? toX(fin) : null;
+  if (rx != null && finX != null && Math.abs(finX - rx) < 14) {
+    finX += finX <= rx ? -14 : 14;
+    finX = Math.max(PAD + 5, Math.min(VB_W - PAD - 5, finX));
+  }
+
+  if (hasFin) {
+    html += `<g class="rec-pctl-line__fin">`;
+    html += `<title>Fin % ${fin}% (final price vs P25–P90 ladder)</title>`;
+    html += `<circle class="rec-pctl-line__fin-dot" cx="${finX}" cy="${BAR_Y}" r="5.25"/>`;
+    html += `</g>`;
+  }
+
   if (hasRec) {
-    const rx = toX(rec);
     html += `<g class="rec-pctl-line__rec">`;
     html += `<title>Rec. Pctl ${rec}%</title>`;
     html += `<line class="rec-pctl-line__rec-stem" x1="${rx}" y1="4" x2="${rx}" y2="12"/>`;
@@ -949,6 +1240,125 @@ function buildRecPctlNumberLineHtml(tier, recPctResolved) {
 
   html += `</svg></div>`;
   return html;
+}
+
+/** CSS `left: X%` along the bar: low pctl at 0%, high pctl at 100%. */
+function recPctlScaleLeftPct(p) {
+  return clampPct0to100(p);
+}
+
+/**
+ * Progress-bar version of Rec. scale: same metrics as the SVG (T/L/F, wks gaps, orange Rec, blue Fin).
+ * 0% left → 100% right, same as the number line.
+ */
+function buildRecPctlProgressBarHtml(tier, recPctResolved, finPctResolved) {
+  if (!tier) return '';
+  const tgt = clampPct0to100(tier.targetPricePercentile);
+  const lower = clampPct0to100(tier.lowerPercentileTo);
+  const floor = clampPct0to100(tier.lowestPricePercentile);
+  const hasRec = recPctResolved != null && Number.isFinite(Number(recPctResolved));
+  const rec = hasRec ? clampPct0to100(recPctResolved) : null;
+  const hasFin = finPctResolved != null && Number.isFinite(Number(finPctResolved));
+  const fin = hasFin ? clampPct0to100(finPctResolved) : null;
+
+  const mT = recPctlScaleLeftPct(tgt);
+  const mL = recPctlScaleLeftPct(lower);
+  const mF = recPctlScaleLeftPct(floor);
+
+  const zLeftTl = Math.min(mT, mL);
+  const zWtl = Math.abs(mT - mL);
+  const zLeftLf = Math.min(mL, mF);
+  const zWlf = Math.abs(mL - mF);
+
+  const midTL = (mT + mL) / 2;
+  const midLF = (mL + mF) / 2;
+
+  const wToLowerStr = formatWeeksOneDecimal(clampWeeksNonNeg(tier.weeksAhead));
+  const wToLowestStr = formatWeeksOneDecimal(clampWeeksNonNeg(tier.weeksToStartReducing));
+
+  let rPin = hasRec ? recPctlScaleLeftPct(rec) : null;
+  let fPin = hasFin ? recPctlScaleLeftPct(fin) : null;
+  if (rPin != null && fPin != null && Math.abs(fPin - rPin) < 6) {
+    fPin += fPin <= rPin ? -6 : 6;
+    fPin = Math.max(2, Math.min(98, fPin));
+  }
+
+  const tipBits = ['Bar: 0% left · 100% right'];
+  if (hasRec) tipBits.push(`Orange ▼ Rec. ${rec}%`);
+  if (hasFin) tipBits.push(`Blue ● Fin ${fin}%`);
+  const tip = `T ${tgt}% · L ${lower}% · F ${floor}% · ${tipBits.join(' · ')}`;
+
+  const zoneTl =
+    zWtl > 0.75
+      ? `<div class="rec-pctl-bar__zone rec-pctl-bar__zone--tl" style="left:${zLeftTl}%;width:${zWtl}%"></div>`
+      : '';
+  const zoneLf =
+    zWlf > 0.75
+      ? `<div class="rec-pctl-bar__zone rec-pctl-bar__zone--lf" style="left:${zLeftLf}%;width:${zWlf}%"></div>`
+      : '';
+
+  const pinAnchor = (kind, mP, pct, letter, tipLine) =>
+    `<div class="rec-pctl-bar__pin rec-pctl-bar__pin--${kind}" style="left:${mP}%" title="${escapeHtmlAttr(tipLine)}">
+      <span class="rec-pctl-bar__pin-knob" aria-hidden="true"></span>
+      <span class="rec-pctl-bar__pin-stem" aria-hidden="true"></span>
+      <span class="rec-pctl-bar__pin-lbl"><span class="rec-pctl-bar__pin-letter">${letter}</span><span class="rec-pctl-bar__pin-num">${pct}</span></span>
+    </div>`;
+
+  let pins = '';
+  pins += pinAnchor('tgt', mT, tgt, 'T', `Target ${tgt}%`);
+  pins += pinAnchor('lower', mL, lower, 'L', `Lower ${lower}%`);
+  pins += pinAnchor('floor', mF, floor, 'F', `Lowest ${floor}%`);
+
+  if (hasFin) {
+    pins += `<div class="rec-pctl-bar__pin rec-pctl-bar__pin--fin" style="left:${fPin}%" title="${escapeHtmlAttr(`Fin % ${fin}% (vs P25–P90 ladder)`)}">
+      <span class="rec-pctl-bar__fin-dot" aria-hidden="true"></span>
+      <span class="rec-pctl-bar__pin-lbl rec-pctl-bar__pin-lbl--fin">${fin}%</span>
+    </div>`;
+  }
+  if (hasRec) {
+    pins += `<div class="rec-pctl-bar__pin rec-pctl-bar__pin--rec" style="left:${rPin}%" title="${escapeHtmlAttr(`Rec. Pctl ${rec}%`)}">
+      <span class="rec-pctl-bar__rec-arrow" aria-hidden="true"></span>
+      <span class="rec-pctl-bar__pin-lbl rec-pctl-bar__pin-lbl--rec">${rec}%</span>
+    </div>`;
+  }
+
+  const wksTl =
+    Math.abs(mT - mL) > 2
+      ? `<span class="rec-pctl-bar__wks" style="left:${midTL}%" title="${escapeHtmlAttr(`Wks to Lower: ${wToLowerStr}`)}">${escapeHtml(
+          wToLowerStr
+        )}</span>`
+      : '';
+  const wksLf =
+    Math.abs(mL - mF) > 2
+      ? `<span class="rec-pctl-bar__wks" style="left:${midLF}%" title="${escapeHtmlAttr(`Wks to Lowest: ${wToLowestStr}`)}">${escapeHtml(
+          wToLowestStr
+        )}</span>`
+      : '';
+
+  return `<div class="rec-pctl-bar-wrap" title="${escapeHtmlAttr(tip)}">
+  <div class="rec-pctl-bar__inner">
+    <div class="rec-pctl-bar__scale-ends" aria-hidden="true"><span>0</span><span>100</span></div>
+    <div class="rec-pctl-bar__track">
+      <div class="rec-pctl-bar__seg-row">
+        <div class="rec-pctl-bar__zones">${zoneTl}${zoneLf}</div>
+        <div class="rec-pctl-bar__baseline" aria-hidden="true"></div>
+      </div>
+      <div class="rec-pctl-bar__mark-layer">${pins}</div>
+    </div>
+    <div class="rec-pctl-bar__wks-row">${wksTl}${wksLf}</div>
+  </div>
+</div>`;
+}
+
+/** SVG number line + progress bar, side by side. */
+function buildRecPctlScaleCellHtml(tier, recPctResolved, finPctResolved) {
+  if (!tier) {
+    return '<div class="rec-pctl-dual"><span class="rec-pctl-line-empty" aria-hidden="true">—</span></div>';
+  }
+  return `<div class="rec-pctl-dual">
+  <div class="rec-pctl-dual__svg">${buildRecPctlNumberLineHtml(tier, recPctResolved, finPctResolved)}</div>
+  <div class="rec-pctl-dual__bar">${buildRecPctlProgressBarHtml(tier, recPctResolved, finPctResolved)}</div>
+</div>`;
 }
 
 /** Color hint on recommended pricing percentile (Rec. Pctl %) column by target level */
@@ -2619,6 +3029,289 @@ function formatFuturePacingPeriodDaysOnly(periodStart, periodEnd) {
   return `${a.d}→${b.d}`;
 }
 
+/**
+ * Summary: groups by calendar month of periodStart (sorted). Rendering splits each group into
+ * rows of at most FUTURE_PACING_SUMMARY_PERIODS_PER_ROW. Invalid periodStart → single-period group.
+ */
+function groupFuturePeriodsForSummaryMonth(fps) {
+  const map = new Map();
+  const invalid = [];
+  for (const fp of fps) {
+    const p = parseFuturePacingYmdParts(fp.periodStart);
+    if (!p) {
+      invalid.push(fp);
+      continue;
+    }
+    const key = `${p.y}-${String(p.m).padStart(2, '0')}`;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(fp);
+  }
+  const sortedKeys = [...map.keys()].sort();
+  const groups = [];
+  for (const key of sortedKeys) {
+    const periods = map.get(key);
+    periods.sort((a, b) => String(a.periodStart).localeCompare(String(b.periodStart)));
+    const p0 = parseFuturePacingYmdParts(periods[0].periodStart);
+    const month0 = p0.m - 1;
+    const first = new Date(p0.y, month0, 1, 12, 0, 0, 0);
+    const monthLabel = first.toLocaleString(undefined, { month: 'short', year: '2-digit' });
+    const rangesStr = periods.map((p) => `${p.periodStart}–${p.periodEnd}`).join('; ');
+    const groupTitle =
+      periods.length > 1
+        ? `${periods.length} periods starting this calendar month · ${rangesStr}`
+        : rangesStr;
+    groups.push({ monthLabel, groupTitle, periods });
+  }
+  for (const fp of invalid) {
+    const periodTitle = `${fp.periodStart} – ${fp.periodEnd}`;
+    groups.push({
+      monthLabel: formatFuturePacingMonthAbbrevRange(fp.periodStart, fp.periodEnd) || '—',
+      groupTitle: periodTitle,
+      periods: [fp],
+    });
+  }
+  return groups;
+}
+
+/** Summary merged cell: at most this many period blocks per table row; extra periods wrap to the next row. */
+const FUTURE_PACING_SUMMARY_PERIODS_PER_ROW = 5;
+
+function chunkArrayForSummaryRows(arr, chunkSize) {
+  const n = Math.max(1, Math.floor(Number(chunkSize)) || 1);
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) {
+    out.push(arr.slice(i, i + n));
+  }
+  return out;
+}
+
+/** Cal through Rec. scale — must match <thead> column count in index.html (17 cells). */
+const FUTURE_PACING_SUMMARY_CAL_THROUGH_REC_COLSPAN = 17;
+
+/** Summary: one column per period — mini cal above LY + Rec. bar, periods laid out horizontally. */
+function buildFuturePacingSummaryPeriodBlockHtml(fp, bookedNightSet) {
+  const tier = fp.tier;
+  const finPctNum =
+    fp.finalPricePercentile != null && Number.isFinite(Number(fp.finalPricePercentile))
+      ? Number(fp.finalPricePercentile)
+      : null;
+  const eff = tier ? tier.effectivePacingPercentile ?? tier.targetPricePercentile : null;
+  const recResolved =
+    tier &&
+    tier.effectivePacingPercentile != null &&
+    Number.isFinite(Number(tier.effectivePacingPercentile))
+      ? tier.effectivePacingPercentile
+      : null;
+  const recBarOnlyHtml = tier ? buildRecPctlProgressBarHtml(tier, recResolved, finPctNum) : '';
+  const recBarWrap =
+    recBarOnlyHtml || '<span class="rec-pctl-line-empty" aria-hidden="true">—</span>';
+  const lyFinBarHtml = buildLyFinOccBarHtml(
+    fp.currentMarketOccupancy,
+    fp.remainingPotential,
+    fp.finalExpectedOccupancy
+  );
+  const periodTitle = `${fp.periodStart} – ${fp.periodEnd}`;
+  const miniCalHtml = buildFuturePeriodMiniCalendarsHtml(
+    bookedNightSet,
+    fp.periodStart,
+    fp.periodEnd
+  );
+  const blockTitle = escapeHtmlAttr(
+    `${periodTitle} · Grey = booked · Blue tint = unbooked · Ring = unbooked night in this period`
+  );
+  const finStr = formatMoneyWhole(fp.finalPrice) ?? '—';
+  const finTitle = escapeHtmlAttr('Final nightly price (Fin $) for this period');
+  const recPriceVal =
+    recResolved != null
+      ? derivePriceFromPercentileLadder(recResolved, fp.priceP25, fp.priceP50, fp.priceP75, fp.priceP90)
+      : null;
+  const hasRecDollar = recPriceVal != null && Number.isFinite(Number(recPriceVal));
+  const recDollarStr = formatMoneyWhole(recPriceVal) ?? '—';
+  const heat = tier && eff != null ? pacingPercentileHeatClass(eff) : '';
+  const recBtnTitle = escapeHtmlAttr(
+    hasRecDollar
+      ? 'Coming soon: set listing price to this recommended rate for this period.'
+      : 'Recommended $ unavailable (P25–P90 ladder or pacing tier missing).'
+  );
+  const recAriaLabel = escapeHtmlAttr(
+    `Set listing price to recommended ${recDollarStr} for ${periodTitle}. Action not available yet.`
+  );
+  const recDollarInner = hasRecDollar
+    ? `<button type="button" class="fp-summary-rec-dollar-btn ${heat}" title="${recBtnTitle}" aria-label="${recAriaLabel}">${escapeHtml(recDollarStr)}</button>`
+    : `<span class="fp-summary-rec-dollar-na" title="${recBtnTitle}">${escapeHtml(recDollarStr)}</span>`;
+  const wksAwayStr =
+    fp.weeksAwayFromAsOf != null && Number.isFinite(fp.weeksAwayFromAsOf)
+      ? (Math.round(fp.weeksAwayFromAsOf * 10) / 10).toFixed(1)
+      : '—';
+  const wksTitle = escapeHtmlAttr(
+    'Weeks from As Of Date (Hospitable pull when shown in the heading, otherwise today) to the first day of this period'
+  );
+  const dollarsHtml = `<div class="fp-summary-period-block__dollars">
+    <div class="fp-summary-dollar-row">
+      <span class="fp-summary-dollar-label">Fin $</span>
+      <span class="fp-summary-dollar-val" title="${finTitle}">${escapeHtml(finStr)}</span>
+    </div>
+    <div class="fp-summary-dollar-row">
+      <span class="fp-summary-dollar-label">Rec. $</span>
+      <span class="fp-summary-dollar-val fp-summary-dollar-val--rec">${recDollarInner}</span>
+    </div>
+    <div class="fp-summary-dollar-row fp-summary-dollar-row--wks">
+      <span class="fp-summary-dollar-label">Wks Away</span>
+      <span class="fp-summary-dollar-val" title="${wksTitle}">${escapeHtml(wksAwayStr)}</span>
+    </div>
+  </div>`;
+  return `<div class="fp-summary-period-block" title="${blockTitle}">
+    <div class="fp-summary-period-block__head">
+      <div class="fp-summary-period-block__cal">${miniCalHtml}</div>
+      ${dollarsHtml}
+    </div>
+    <div class="fp-summary-period-block__bars">
+      <div class="fp-summary-ly-rec-stack">
+        <div class="fp-summary-ly-block">${lyFinBarHtml}</div>
+        <div class="fp-summary-rec-block">${recBarWrap}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/** One <tr>. summaryGroup: merged Cal→Rec. cell with per-period cal+bars columns; fp = periods[0] for hidden full cols. */
+function buildFuturePacingTableRowHtml(fp, bookedNightSet, futureTableAsOfYmd, summaryGroup) {
+  const currentStr = formatPctWhole(fp.currentMarketOccupancy) ?? '—';
+  const lytStr = formatPctWhole(fp.lastYearTodayOccupancy) ?? '—';
+  const finalStr = formatPctWhole(fp.finalExpectedOccupancy) ?? '—';
+  const remainingStr = formatPctWhole(fp.remainingPotential) ?? '—';
+  const remainingLyStr = formatPctWhole(fp.remainingPotentialLY) ?? '—';
+  const wksAwayStr =
+    fp.weeksAwayFromAsOf != null && Number.isFinite(fp.weeksAwayFromAsOf)
+      ? (Math.round(fp.weeksAwayFromAsOf * 10) / 10).toFixed(1)
+      : '—';
+  const finStr = formatMoneyWhole(fp.finalPrice) ?? '—';
+  const finPctStr = formatPctWhole(fp.finalPricePercentile) ?? '—';
+  const p25Str = formatMoneyWhole(fp.priceP25) ?? '—';
+  const p50Str = formatMoneyWhole(fp.priceP50) ?? '—';
+  const p75Str = formatMoneyWhole(fp.priceP75) ?? '—';
+  const p90Str = formatMoneyWhole(fp.priceP90) ?? '—';
+  const finPctNum =
+    fp.finalPricePercentile != null && Number.isFinite(Number(fp.finalPricePercentile))
+      ? Number(fp.finalPricePercentile)
+      : null;
+  const tier = fp.tier;
+  const eff = tier ? tier.effectivePacingPercentile ?? tier.targetPricePercentile : null;
+  const pctStr = tier && eff != null ? `${eff}%` : '—';
+  const tierTitleAttr = tier
+    ? ` title="${buildRecPctlCellTitle(tier, eff, {
+        wksAway: fp.weeksAwayFromAsOf,
+        lyFinPct: fp.finalExpectedOccupancy,
+      })}"`
+    : '';
+  const heat = tier && eff != null ? pacingPercentileHeatClass(eff) : '';
+  const tierClass = tier ? `pct-cell ${heat}` : 'pct-cell';
+  const recResolved =
+    tier &&
+    tier.effectivePacingPercentile != null &&
+    Number.isFinite(Number(tier.effectivePacingPercentile))
+      ? tier.effectivePacingPercentile
+      : null;
+  const recBarOnlyHtml = tier ? buildRecPctlProgressBarHtml(tier, recResolved, finPctNum) : '';
+  const recDualHtml = buildRecPctlScaleCellHtml(tier, recResolved, finPctNum);
+  const recBarWrap =
+    recBarOnlyHtml || '<span class="rec-pctl-line-empty" aria-hidden="true">—</span>';
+  const recPriceVal =
+    recResolved != null
+      ? derivePriceFromPercentileLadder(recResolved, fp.priceP25, fp.priceP50, fp.priceP75, fp.priceP90)
+      : null;
+  const recDollarStr = formatMoneyWhole(recPriceVal) ?? '—';
+  const recDollarTitle =
+    recResolved != null
+      ? escapeHtmlAttr(
+          recPriceVal != null
+            ? `Rec. Pctl % ${recResolved}%; same P25–P90 ladder as Fin %`
+            : `Rec. Pctl % ${recResolved}%; P25–P90 ladder unavailable for this period`
+        )
+      : '';
+  const recDollarTitleAttr = recDollarTitle ? ` title="${recDollarTitle}"` : '';
+  let recMinusFinStr = '—';
+  let recMinusFinTitleAttr = '';
+  let recMinusFinStyleAttr = '';
+  if (tier != null && eff != null && finPctNum != null) {
+    const d = Math.round(Number(eff) - finPctNum);
+    recMinusFinStr = `${d > 0 ? '+' : ''}${d}%`;
+    recMinusFinTitleAttr = ` title="${escapeHtmlAttr(`Rec. Pctl % (${eff}) − Fin % (${finPctNum})`)}"`;
+    const diffCss = formatRecMinusFinDiffStyle(d);
+    if (diffCss) recMinusFinStyleAttr = ` style="${escapeHtmlAttr(diffCss)}"`;
+  }
+  const dowRange = formatDowRange(fp.periodStart, fp.periodEnd);
+  const monthAbbrev = formatFuturePacingMonthAbbrevRange(fp.periodStart, fp.periodEnd);
+  const periodDays = formatFuturePacingPeriodDaysOnly(fp.periodStart, fp.periodEnd);
+  const periodTitle = `${fp.periodStart} – ${fp.periodEnd}`;
+  const miniCalHtml = buildFuturePeriodMiniCalendarsHtml(
+    bookedNightSet,
+    fp.periodStart,
+    fp.periodEnd
+  );
+  const miniCalTitle = escapeHtmlAttr(
+    `${periodTitle} · Grey = booked · Blue tint = unbooked · Ring = unbooked night in this period`
+  );
+  const lyFinBarHtml = buildLyFinOccBarHtml(
+    fp.currentMarketOccupancy,
+    fp.remainingPotential,
+    fp.finalExpectedOccupancy
+  );
+
+  let monthTd;
+  let calThroughRecTds;
+  if (summaryGroup) {
+    const perRow = FUTURE_PACING_SUMMARY_PERIODS_PER_ROW;
+    const parts = summaryGroup.periods.map((p) =>
+      buildFuturePacingSummaryPeriodBlockHtml(p, bookedNightSet)
+    );
+    for (let i = parts.length; i < perRow; i++) {
+      parts.push(
+        '<div class="fp-summary-period-block fp-summary-period-block--empty" aria-hidden="true"></div>'
+      );
+    }
+    const blocks = parts.join('');
+    const rs = summaryGroup.summaryMonthRowspan ?? 1;
+    const showMonth = summaryGroup.summaryShowMonthCell !== false;
+    monthTd = showMonth
+      ? `<td class="future-pacing-month-cell future-pacing-month-cell--summary-group" rowspan="${rs}">${buildFuturePacingSummaryMonthCellInnerHtml(
+          summaryGroup.monthLabel,
+          summaryGroup.groupTitle,
+          summaryGroup.summaryMonthMetrics ?? null
+        )}</td>`
+      : '';
+    calThroughRecTds = `<td colspan="${FUTURE_PACING_SUMMARY_CAL_THROUGH_REC_COLSPAN}" class="future-pacing-summary-cal-rec-merge"><div class="fp-summary-hz-row">${blocks}</div></td>`;
+  } else {
+    monthTd = `<td class="future-pacing-month-cell" title="${escapeHtmlAttr(periodTitle)}">${escapeHtml(monthAbbrev)}</td>`;
+    calThroughRecTds = `<td class="future-pacing-cal-cell" title="${miniCalTitle}">${miniCalHtml}</td>
+            <td class="future-pacing-lybar-cell fp-full-only">${lyFinBarHtml}</td>
+            <td class="future-pacing-period-cell fp-full-only" title="${escapeHtmlAttr(periodTitle)}">${periodDays}</td>
+            <td class="future-pacing-dow-cell fp-full-only" title="${dowRange}">${dowRange}</td>
+            <td class="future-pacing-num-cell fp-full-only">${fp.unbookedNights}</td>
+            <td class="pct-cell future-pacing-detail-col fp-full-only">${currentStr}</td>
+            <td class="pct-cell future-pacing-detail-col fp-full-only">${lytStr}</td>
+            <td class="pct-cell fp-full-only">${remainingStr}</td>
+            <td class="pct-cell future-pacing-detail-col fp-full-only">${remainingLyStr}</td>
+            <td class="pct-cell fp-full-only">${finalStr}</td>
+            <td class="future-pacing-num-cell fp-full-only" title="As Of ${futureTableAsOfYmd} → period start ${fp.periodStart}">${wksAwayStr}</td>
+            <td class="money-cell fp-full-only">${finStr}</td>
+            <td class="pct-cell fp-full-only">${finPctStr}</td>
+            <td class="pct-cell future-pacing-rec-minus-fin fp-full-only"${recMinusFinTitleAttr}${recMinusFinStyleAttr}>${recMinusFinStr}</td>
+            <td class="money-cell fp-full-only ${heat}"${recDollarTitleAttr}>${recDollarStr}</td>
+            <td class="fp-full-only ${tierClass}"${tierTitleAttr}>${pctStr}</td>
+            <td class="future-pacing-rec-line-cell"><div class="fp-rec-summary-only"><div class="fp-summary-ly-rec-stack"><div class="fp-summary-ly-block">${lyFinBarHtml}</div><div class="fp-summary-rec-block">${recBarWrap}</div></div></div><div class="fp-rec-full-only">${recDualHtml}</div></td>`;
+  }
+
+  return `<tr>
+            ${monthTd}
+            ${calThroughRecTds}
+            <td class="money-cell future-pacing-detail-col fp-full-only">${p25Str}</td>
+            <td class="money-cell future-pacing-detail-col fp-full-only">${p50Str}</td>
+            <td class="money-cell future-pacing-detail-col fp-full-only">${p75Str}</td>
+            <td class="money-cell future-pacing-detail-col fp-full-only">${p90Str}</td>
+          </tr>`;
+}
+
 function normalizeUnbookedHorizonDays(raw) {
   const n = Number(raw);
   if (UNBOOKED_HORIZON_OPTIONS.includes(n)) return n;
@@ -2726,6 +3419,41 @@ function applyFuturePacingTableDetailsFromStorage() {
   syncFuturePacingTableDetailsUI();
 }
 
+function getFuturePacingTableView() {
+  return localStorage.getItem(STORAGE_KEYS.futurePacingTableView) === 'full' ? 'full' : 'summary';
+}
+
+function applyFuturePacingTableView() {
+  const table = document.getElementById('futurePacingTable');
+  if (!table) return;
+  const v = getFuturePacingTableView();
+  table.classList.toggle('fp-view-summary', v === 'summary');
+  table.classList.toggle('fp-view-full', v === 'full');
+  syncFuturePacingViewToggleUI();
+}
+
+function syncFuturePacingViewToggleUI() {
+  const v = getFuturePacingTableView();
+  const sumBtn = document.getElementById('futurePacingViewSummary');
+  const fullBtn = document.getElementById('futurePacingViewFull');
+  const detailsBtn = document.getElementById('futurePacingDetailsToggle');
+  if (sumBtn) {
+    const on = v === 'summary';
+    sumBtn.classList.toggle('fp-view-toggle--active', on);
+    sumBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  if (fullBtn) {
+    const on = v === 'full';
+    fullBtn.classList.toggle('fp-view-toggle--active', on);
+    fullBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  if (detailsBtn) {
+    detailsBtn.disabled = v === 'summary';
+    detailsBtn.title =
+      v === 'summary' ? 'Switch to Full table to show optional detail columns' : '';
+  }
+}
+
 function render(reservations, periodKey, revenueTarget) {
   updateUnbookedSectionHeading();
   applyFuturePacingTableDetailsFromStorage();
@@ -2758,6 +3486,7 @@ function render(reservations, periodKey, revenueTarget) {
     if (emptyHint) emptyHint.hidden = false;
     if (tableEl) tableEl.hidden = true;
     syncFuturePacingTableToolbarVisibility();
+    applyFuturePacingTableView();
     renderMarketCsvPanel();
     return;
   }
@@ -2824,100 +3553,41 @@ function render(reservations, periodKey, revenueTarget) {
     if (tableEl) tableEl.hidden = false;
     if (tbody) {
       const futureTableAsOfYmd = getFuturePacingAsOfYmd();
-      tbody.innerHTML = futurePeriodsWithMarket
-        .map((fp) => {
-          const currentStr = formatPctWhole(fp.currentMarketOccupancy) ?? '—';
-          const lytStr = formatPctWhole(fp.lastYearTodayOccupancy) ?? '—';
-          const finalStr = formatPctWhole(fp.finalExpectedOccupancy) ?? '—';
-          const remainingStr = formatPctWhole(fp.remainingPotential) ?? '—';
-          const remainingLyStr = formatPctWhole(fp.remainingPotentialLY) ?? '—';
-          const wksAwayStr =
-            fp.weeksAwayFromAsOf != null && Number.isFinite(fp.weeksAwayFromAsOf)
-              ? (Math.round(fp.weeksAwayFromAsOf * 10) / 10).toFixed(1)
-              : '—';
-          const finStr = formatMoneyWhole(fp.finalPrice) ?? '—';
-          const finPctStr = formatPctWhole(fp.finalPricePercentile) ?? '—';
-          const p25Str = formatMoneyWhole(fp.priceP25) ?? '—';
-          const p50Str = formatMoneyWhole(fp.priceP50) ?? '—';
-          const p75Str = formatMoneyWhole(fp.priceP75) ?? '—';
-          const p90Str = formatMoneyWhole(fp.priceP90) ?? '—';
-          const tier = fp.tier;
-          const eff = tier ? tier.effectivePacingPercentile ?? tier.targetPricePercentile : null;
-          const pctStr = tier && eff != null ? `${eff}%` : '—';
-          const tierTitleAttr = tier
-            ? ` title="${buildRecPctlCellTitle(tier, eff, {
-                wksAway: fp.weeksAwayFromAsOf,
-                lyFinPct: fp.finalExpectedOccupancy,
-              })}"`
-            : '';
-          const heat = tier && eff != null ? pacingPercentileHeatClass(eff) : '';
-          const tierClass = tier ? `pct-cell ${heat}` : 'pct-cell';
-          const recResolved =
-            tier &&
-            tier.effectivePacingPercentile != null &&
-            Number.isFinite(Number(tier.effectivePacingPercentile))
-              ? tier.effectivePacingPercentile
-              : null;
-          const recLineHtml = buildRecPctlNumberLineHtml(tier, recResolved);
-          const recPriceVal =
-            recResolved != null
-              ? derivePriceFromPercentileLadder(recResolved, fp.priceP25, fp.priceP50, fp.priceP75, fp.priceP90)
-              : null;
-          const recDollarStr = formatMoneyWhole(recPriceVal) ?? '—';
-          const recDollarTitle =
-            recResolved != null
-              ? escapeHtmlAttr(
-                  recPriceVal != null
-                    ? `Rec. Pctl % ${recResolved}%; same P25–P90 ladder as Fin %`
-                    : `Rec. Pctl % ${recResolved}%; P25–P90 ladder unavailable for this period`
-                )
-              : '';
-          const recDollarTitleAttr = recDollarTitle ? ` title="${recDollarTitle}"` : '';
-          const finPctNum =
-            fp.finalPricePercentile != null && Number.isFinite(Number(fp.finalPricePercentile))
-              ? Number(fp.finalPricePercentile)
-              : null;
-          let recMinusFinStr = '—';
-          let recMinusFinTitleAttr = '';
-          let recMinusFinStyleAttr = '';
-          if (tier != null && eff != null && finPctNum != null) {
-            const d = Math.round(Number(eff) - finPctNum);
-            recMinusFinStr = `${d > 0 ? '+' : ''}${d}%`;
-            recMinusFinTitleAttr = ` title="${escapeHtmlAttr(`Rec. Pctl % (${eff}) − Fin % (${finPctNum})`)}"`;
-            const diffCss = formatRecMinusFinDiffStyle(d);
-            if (diffCss) recMinusFinStyleAttr = ` style="${escapeHtmlAttr(diffCss)}"`;
-          }
-          const dowRange = formatDowRange(fp.periodStart, fp.periodEnd);
-          const monthAbbrev = formatFuturePacingMonthAbbrevRange(fp.periodStart, fp.periodEnd);
-          const periodDays = formatFuturePacingPeriodDaysOnly(fp.periodStart, fp.periodEnd);
-          const periodTitle = `${fp.periodStart} – ${fp.periodEnd}`;
-          return `<tr>
-            <td class="future-pacing-month-cell" title="${periodTitle}">${monthAbbrev}</td>
-            <td class="future-pacing-period-cell" title="${periodTitle}">${periodDays}</td>
-            <td class="future-pacing-dow-cell" title="${dowRange}">${dowRange}</td>
-            <td class="future-pacing-num-cell">${fp.unbookedNights}</td>
-            <td class="pct-cell future-pacing-detail-col">${currentStr}</td>
-            <td class="pct-cell future-pacing-detail-col">${lytStr}</td>
-            <td class="pct-cell">${remainingStr}</td>
-            <td class="pct-cell future-pacing-detail-col">${remainingLyStr}</td>
-            <td class="pct-cell">${finalStr}</td>
-            <td class="future-pacing-num-cell" title="As Of ${futureTableAsOfYmd} → period start ${fp.periodStart}">${wksAwayStr}</td>
-            <td class="money-cell">${finStr}</td>
-            <td class="pct-cell">${finPctStr}</td>
-            <td class="pct-cell future-pacing-rec-minus-fin"${recMinusFinTitleAttr}${recMinusFinStyleAttr}>${recMinusFinStr}</td>
-            <td class="money-cell ${heat}"${recDollarTitleAttr}>${recDollarStr}</td>
-            <td class="${tierClass}"${tierTitleAttr}>${pctStr}</td>
-            <td class="future-pacing-rec-line-cell">${recLineHtml}</td>
-            <td class="money-cell future-pacing-detail-col">${p25Str}</td>
-            <td class="money-cell future-pacing-detail-col">${p50Str}</td>
-            <td class="money-cell future-pacing-detail-col">${p75Str}</td>
-            <td class="money-cell future-pacing-detail-col">${p90Str}</td>
-          </tr>`;
-        })
-        .join('');
+      const bookedNightSet = buildBookedNightsSet(reservations);
+      const isFpSummary = getFuturePacingTableView() === 'summary';
+      tbody.innerHTML = isFpSummary
+        ? groupFuturePeriodsForSummaryMonth(futurePeriodsWithMarket)
+            .flatMap((g) => {
+              const p0 = parseFuturePacingYmdParts(g.periods[0].periodStart);
+              const summaryMonthMetrics = p0
+                ? computeCalendarMonthOccupancyMetrics(reservations, p0.y, p0.m - 1)
+                : null;
+              const chunks = chunkArrayForSummaryRows(
+                g.periods,
+                FUTURE_PACING_SUMMARY_PERIODS_PER_ROW
+              );
+              const n = chunks.length;
+              return chunks.map((chunk, i) =>
+                buildFuturePacingTableRowHtml(chunk[0], bookedNightSet, futureTableAsOfYmd, {
+                  monthLabel: g.monthLabel,
+                  groupTitle: g.groupTitle,
+                  periods: chunk,
+                  summaryMonthRowspan: n,
+                  summaryShowMonthCell: i === 0,
+                  summaryMonthMetrics: i === 0 ? summaryMonthMetrics : null,
+                })
+              );
+            })
+            .join('')
+        : futurePeriodsWithMarket
+            .map((fp) =>
+              buildFuturePacingTableRowHtml(fp, bookedNightSet, futureTableAsOfYmd, null)
+            )
+            .join('');
     }
   }
   syncFuturePacingTableToolbarVisibility();
+  applyFuturePacingTableView();
   renderFuturePacingCharts(futurePeriodsWithMarket);
   renderRevenueMetricsChart(reservations);
   renderMarketCsvPanel();
@@ -2956,6 +3626,17 @@ function init() {
       localStorage.removeItem(STORAGE_KEYS.futurePacingTableDetailsVisible);
     }
     syncFuturePacingTableDetailsUI();
+  });
+
+  document.getElementById('futurePacingViewSummary')?.addEventListener('click', () => {
+    localStorage.removeItem(STORAGE_KEYS.futurePacingTableView);
+    applyFuturePacingTableView();
+    render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
+  });
+  document.getElementById('futurePacingViewFull')?.addEventListener('click', () => {
+    localStorage.setItem(STORAGE_KEYS.futurePacingTableView, 'full');
+    applyFuturePacingTableView();
+    render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);
   });
 
   const marketCsvInput = document.getElementById('marketCsvInput');
@@ -3172,11 +3853,18 @@ function init() {
               'Open DevTools → Network → this request → Response for full diagnostics.'
           );
         }
-        reservations = raw.map((r) => ({
-          checkIn: r.checkIn,
-          checkOut: r.checkOut,
-          revenue: Number(r.revenue) || 0,
-        }));
+        reservations = raw.map((r) => {
+          const row = {
+            checkIn: r.checkIn,
+            checkOut: r.checkOut,
+            revenue: Number(r.revenue) || 0,
+          };
+          if (r.hostPayout != null && r.hostPayout !== '') {
+            const hp = Number(r.hostPayout);
+            if (Number.isFinite(hp)) row.hostPayout = hp;
+          }
+          return row;
+        });
         setHospitableAsOfToNow();
         saveStored(parseFloat(targetInput.value) || null, reservations);
         render(reservations, PACING_PERIOD_KEY, parseFloat(targetInput.value) || null);

@@ -180,6 +180,24 @@
         <div id="futurePacingTableWrap" class="future-pacing-wrap">
           <p class="empty-hint" id="futurePacingEmpty">Load data to see future periods and market pacing.</p>
           <div class="future-pacing-table-toolbar" id="futurePacingTableToolbar" hidden>
+            <div class="future-pacing-view-toggle" role="group" aria-label="Future table columns">
+              <button
+                type="button"
+                class="btn-secondary btn-small fp-view-toggle"
+                id="futurePacingViewSummary"
+                aria-pressed="true"
+              >
+                Summary
+              </button>
+              <button
+                type="button"
+                class="btn-secondary btn-small fp-view-toggle"
+                id="futurePacingViewFull"
+                aria-pressed="false"
+              >
+                Full table
+              </button>
+            </div>
             <button
               type="button"
               class="btn-secondary btn-small"
@@ -189,29 +207,31 @@
               Show Details
             </button>
           </div>
-          <table class="future-pacing-table" id="futurePacingTable" hidden>
+          <table class="future-pacing-table fp-view-summary" id="futurePacingTable" hidden>
             <thead>
               <tr>
-                <th title="Calendar month of the period (range if it spans months)">Month</th>
-                <th title="Calendar days in the period (full dates on hover)">Period</th>
-                <th title="Days of week">DOW</th>
-                <th title="Unbooked nights">Nts</th>
-                <th class="future-pacing-detail-col" title="Market occupancy (current)">Cur</th>
-                <th class="future-pacing-detail-col" title="Market occupancy last year today (pace)">LYT</th>
-                <th title="Remaining potential vs current (LY final − current, or file)">Rem</th>
-                <th class="future-pacing-detail-col" title="Remaining potential vs LY pace (LY final − LYT)">Rm LY</th>
-                <th title="Market occupancy LY final (realized)">LY Fin</th>
-                <th title="Weeks from As Of Date (Hospitable pull when shown in the heading, otherwise today) to the first calendar day of the period">Wks Away</th>
-                <th title="Final / recommended nightly price">Fin $</th>
-                <th title="Implied percentile of Final $ vs P25–P90 (piecewise linear)">Fin %</th>
-                <th title="Rec. Pctl % minus Fin % (percentage points)">Rec−Fin</th>
-                <th title="Nightly rate implied by Rec. Pctl % on the same P25–P90 piecewise-linear ladder as Fin %">Rec. $</th>
-                <th title="Recommended price percentile from pacing row (LY Fin vs settings) and Wks Away vs Wks to Lower / Wks to Lowest. Hover a cell for inputs and the full formula.">Rec. Pctl %</th>
-                <th title="Number line: T = Target, L = Lower, F = Lowest. Higher percentile on the left, lower on the right. Arrow = Rec. Pctl %.">Rec. scale</th>
-                <th class="future-pacing-detail-col" title="25th percentile market price">P25</th>
-                <th class="future-pacing-detail-col" title="50th percentile (median) market price">P50</th>
-                <th class="future-pacing-detail-col" title="75th percentile market price">P75</th>
-                <th class="future-pacing-detail-col" title="90th percentile market price">P90</th>
+                <th title="Summary: month label; revenue is the full booking amount in the check-in month only (not split across months); guest nights vs nights in month. Up to 5 period slots per row. Full: abbreviated month or range for that period.">Month</th>
+                <th title="Mini month grid (Full). Summary: merged with columns through Rec. scale — each period is cal above LY + Rec. bars, periods in a row.">Cal</th>
+                <th class="fp-full-only" title="0–100% bar: grey = Cur, color = remaining (Cur + Rem = LY fin), dim tail to 100%. Pins: light = current occ. %, amber = LY fin %; % only under bar. Rem % above colored segment.">LY bar</th>
+                <th class="fp-full-only" title="Calendar days in the period (full dates on hover)">Period</th>
+                <th class="fp-full-only" title="Days of week">DOW</th>
+                <th class="fp-full-only" title="Unbooked nights">Nts</th>
+                <th class="future-pacing-detail-col fp-full-only" title="Market occupancy (current)">Cur</th>
+                <th class="future-pacing-detail-col fp-full-only" title="Market occupancy last year today (pace)">LYT</th>
+                <th class="fp-full-only" title="Remaining potential vs current (LY final − current, or file)">Rem</th>
+                <th class="future-pacing-detail-col fp-full-only" title="Remaining potential vs LY pace (LY final − LYT)">Rm LY</th>
+                <th class="fp-full-only" title="Market occupancy LY final (realized)">LY Fin</th>
+                <th class="fp-full-only" title="Weeks from As Of Date (Hospitable pull when shown in the heading, otherwise today) to the first calendar day of the period">Wks Away</th>
+                <th class="fp-full-only" title="Final / recommended nightly price">Fin $</th>
+                <th class="fp-full-only" title="Implied percentile of Final $ vs P25–P90 (piecewise linear)">Fin %</th>
+                <th class="fp-full-only" title="Rec. Pctl % minus Fin % (percentage points)">Rec−Fin</th>
+                <th class="fp-full-only" title="Nightly rate implied by Rec. Pctl % on the same P25–P90 piecewise-linear ladder as Fin %">Rec. $</th>
+                <th class="fp-full-only" title="Recommended price percentile from pacing row (LY Fin vs settings) and Wks Away vs Wks to Lower / Wks to Lowest. Hover a cell for inputs and the full formula.">Rec. Pctl %</th>
+                <th title="Summary: merged with Cal — each period’s Rec. progress bar sits under its calendar. Full: LY bar in its own column; here SVG number line + bar. T/L/F, wks, orange ▼ Rec., blue ● Fin. Low → high pctl left → right.">Rec. scale</th>
+                <th class="future-pacing-detail-col fp-full-only" title="25th percentile market price">P25</th>
+                <th class="future-pacing-detail-col fp-full-only" title="50th percentile (median) market price">P50</th>
+                <th class="future-pacing-detail-col fp-full-only" title="75th percentile market price">P75</th>
+                <th class="future-pacing-detail-col fp-full-only" title="90th percentile market price">P90</th>
               </tr>
             </thead>
             <tbody id="futurePacingBody"></tbody>
